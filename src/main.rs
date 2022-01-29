@@ -1,8 +1,8 @@
-const BASIC_C_TYPE: [&'static str; 12] = [
+const _BASIC_C_TYPE: [&'static str; 12] = [
     "void", "char", "float", "double", "uint8_t", "uint16_t", "uint32_t", "uint64_t", "int32_t",
     "int64_t", "size_t", "int",
 ];
-const BASIC_RUST_TYPE: [&'static str; 12] = [
+const _BASIC_RUST_TYPE: [&'static str; 12] = [
     "c_void", "c_char", "f32", "f64", "u8", "u16", "u32", "u64", "i32", "i64", "usize", "i32",
 ];
 
@@ -30,27 +30,58 @@ fn process(registry: roxmltree::Document) {
 
             if name == "enums" {
                 if let Some(name) = child.attribute("name") {
-                    println!("Enums: {} has {} children", name, child.children().count());
                     if let Some(e) = enums.iter_mut().find(|e| e.name == name) {
                         generate_variants(e, &child);
                     } else {
-                        eprintln!("Unseen enum {} encountered!", name);
+                        let e = Enum {
+                            name,
+                            enumerants: Vec::new(),
+                        };
+                        enums.push(e);
                     }
                 } else {
                     eprintln!("Unnamed enum found!");
+                }
+            } else if name == "extensions" {
+                for e in child.children() {
+                    if e.is_element() {
+                        if let Some(name) = e.attribute("name") {
+                            eprintln!("{} extension found!", name);
+                            for ext in e.children() {
+                                if ext.is_element() {
+                                    let name = ext.tag_name().name();
+                                    if name == "require" {
+                                        for req in ext.children() {
+                                            let name = req.tag_name().name();
+                                            eprintln!("\t{}", name);
+                                        }
+                                    } else if name == "remove" {
+                                        eprintln!("\tRemove request");
+                                    }
+                                }
+                            }
+                        } else {
+                            eprintln!("Unnamed extension found!");
+                        }
+                    }
                 }
             }
         }
     }
 
+    let mut buffer = String::with_capacity(256);
+
+    println!("use std::{{ffi::c_void, os::raw::c_char}};\n");
     for e in enums {
-        eprintln!("#[derive(Clone, Copy, Debug)]");
-        eprintln!("#[repr(C)]");
-        eprintln!("pub enum {} {{", vk_type_to_rust_type(e.name));
-        for v in vk2rv(e.name, &e.enumerants).iter() {
-            eprintln!("    {} = {},", v.name, v.value);
-        }
-        eprintln!("}}\n");
+        vk2rt(e.name, &mut buffer);
+
+        println!("#[derive(Clone, Copy, Debug)]");
+        println!("#[repr(C)]");
+        println!("pub enum {} {{", buffer);
+        vk2rv(e.name, &e.enumerants);
+        println!("}}\n");
+
+        buffer.clear();
     }
 }
 
@@ -69,11 +100,13 @@ fn generate_enums<'r, 's>(root: &'r roxmltree::Node<'s, 's>) -> Vec<Enum<'s>> {
 
 fn generate_variants<'b, 'n>(e: &'b mut Enum<'n>, node: &'b roxmltree::Node<'n, 'n>) {
     for child in node.children() {
-        if child.is_element() {
+        let name = child.tag_name().name();
+        if child.is_element() && (name == "enum") {
             let name = child
                 .attribute("name")
                 .map(|s| String::from(s).into_boxed_str())
                 .unwrap_or(String::from("UnknownEnumerant").into_boxed_str());
+
             if let Some(value) = child.attribute("value") {
                 let enumerant = Enumerant {
                     name,
@@ -95,22 +128,23 @@ fn generate_variants<'b, 'n>(e: &'b mut Enum<'n>, node: &'b roxmltree::Node<'n, 
                 };
                 e.enumerants.push(enumerant);
             } else if let Some(_offset) = child.attribute("offset") {
-                println!("Enumerant with offset found!");
+                eprintln!("Enumerant with offset found!");
             } else {
-                println!("Enumerant with no value found!");
+                eprintln!("Enumerant {} has no value!", name);
             }
         }
     }
 }
 
-fn vk_type_to_rust_type(vk_name: &str) -> Box<str> {
-    // Skip past `Vk`
-    vk_name.chars().skip(2).collect::<String>().into_boxed_str()
+/// Convert a Vulkan type to a Rust type
+fn vk2rt(vk_name: &str, buffer: &mut String) {
+    buffer.extend(vk_name.chars().skip(2))
 }
 
-fn vk2rv(name: &str, variants: &[Enumerant]) -> Box<[Enumerant]> {
+/// Convert a Vulkan enumeration variant to a Rust-style enumeration variant.
+fn vk2rv(name: &str, variants: &[Enumerant]) {
     if variants.len() == 0 {
-        return Box::new([]);
+        return;
     }
 
     let mut prefix = Vec::with_capacity(128);
@@ -121,8 +155,6 @@ fn vk2rv(name: &str, variants: &[Enumerant]) -> Box<[Enumerant]> {
             .take(2)
             .map(|b| (b as char).to_ascii_uppercase() as u8),
     );
-
-    // Make the rest of the type name SCREAMING_SNAKE_CASE
     cc2ssc(&mut prefix, name.bytes().skip(2));
 
     // Append / so we pick up the end of the name and stop matching
@@ -130,52 +162,47 @@ fn vk2rv(name: &str, variants: &[Enumerant]) -> Box<[Enumerant]> {
 
     // Working buffer
     let mut buffer = Vec::with_capacity(128);
-
     variants
         .iter()
-        .map(|v| {
+        .for_each(|v| {
             let prefix_index = prefix.iter().zip(v.name.bytes()).position(|(&l, r)| l != r);
 
             match prefix_index {
                 Some(0) | None => {
-                    println!(
+                    eprintln!(
                         "Unable to find common prefix in {} -> {:?}",
                         name,
                         std::str::from_utf8(&prefix)
                     );
-
-                    v.clone()
                 }
                 Some(x) => {
-                    let suffixes = ["_BIT", "_NV", "_KHR"];
+                    let suffixes = [
+                        "_BIT_ANDROID",
+                        "_BIT",
+                        "_BIT_EXT",
+                        "_BIT_KHR",
+                        "_EXT",
+                        "_NV",
+                        "_KHR",
+                    ];
                     let trimmed = trim_suffix(&v.name[x..], &suffixes);
-
-                    // Make the trimmed variant name CamelCase
                     ssc2cc(&mut buffer, trimmed.bytes());
 
                     let name = std::str::from_utf8(&buffer)
-                        .expect("Enum variant conversion resulted in non-UTF-8 output!")
-                        .to_string()
-                        .into_boxed_str();
+                        .expect("Enum variant conversion resulted in non-UTF-8 output!");
 
+                    println!("    {} = {}", name, v.value);
                     buffer.clear();
-                    Enumerant {
-                        name,
-                        value: v.value.clone(),
-                    }
                 }
             }
         })
-        .collect()
 }
 
 fn types_path<'b, 'i>(types: &'b roxmltree::Node<'i, 'i>) -> Vec<Enum<'i>> {
     let mut enums = Vec::with_capacity(256);
 
-    eprintln!("use std::{{ffi::c_void, os::raw::c_char}};\n");
-
     if let Some(comment) = types.attribute("comment") {
-        println!("{}", comment);
+        eprintln!("{}", comment);
     }
 
     for vk_type in types.descendants() {
@@ -187,28 +214,24 @@ fn types_path<'b, 'i>(types: &'b roxmltree::Node<'i, 'i>) -> Vec<Enum<'i>> {
             }
 
             if let Some(name) = vk_type.attribute("name") {
-                if let Some(index) = BASIC_C_TYPE.iter().position(|s| s == &name) {
-                    println!("{} -> {}", name, BASIC_RUST_TYPE[index]);
-                } else if let Some("enum") = vk_type.attribute("category") {
+                if let Some("enum") = vk_type.attribute("category") {
                     let e = Enum {
                         name,
                         enumerants: Vec::new(),
                     };
                     enums.push(e);
-
-                    println!("Added enum {}", name);
                 } else {
-                    print!("{}: ", name);
+                    eprint!("{}: ", name);
                     for attribute in vk_type.attributes() {
-                        print!("({}, {}), ", attribute.name(), attribute.value());
+                        eprint!("({}, {}), ", attribute.name(), attribute.value());
                     }
 
                     if let Some(text) = vk_type.text() {
                         if !text.chars().all(char::is_whitespace) {
-                            println!("{}", text);
+                            eprintln!("{}", text);
                         }
                     } else {
-                        println!();
+                        eprintln!();
                     }
                 }
             }
@@ -229,6 +252,8 @@ struct Enumerant {
     value: Box<str>,
 }
 
+/// Convert an iterator over bytes, `B`, from CamelCase to SCREAMING_SNAKE_CASE storing it in
+/// `buffer`.
 fn cc2ssc<B>(buffer: &mut Vec<u8>, name: B)
 where
     B: Iterator<Item = u8>,
@@ -243,9 +268,11 @@ where
     }
 }
 
+/// Convert an iterator over bytes, `B`, from SCREAMING_SNAKE_CASE to CamelCase storing it in
+/// `buffer`.
 fn ssc2cc<B>(buffer: &mut Vec<u8>, bytes: B)
 where
-    B: Iterator<Item = u8>
+    B: Iterator<Item = u8>,
 {
     let mut capitalize = true;
     for c in bytes {
@@ -261,9 +288,13 @@ where
 }
 
 fn trim_suffix<'t>(s: &'t str, suffixes: &'t [&str]) -> &'t str {
-    if let Some(suffix) = suffixes.iter().find(|&&s| s.ends_with(s)) {
-        let y = s.len() - suffix.len();
-        &s[..y]
+    if let Some(suffix) = suffixes.iter().find(|&&suffix| s.ends_with(suffix)) {
+        if suffix.len() < s.len() {
+            let y = s.len() - suffix.len();
+            &s[..y]
+        } else {
+            &s
+        }
     } else {
         &s
     }

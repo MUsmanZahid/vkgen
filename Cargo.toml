@@ -8,3 +8,6 @@ edition = "2018"
 
 [dependencies]
 roxmltree = "0.14.1"
+
+[profile.dev]
+opt-level = 1
