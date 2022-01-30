@@ -6,23 +6,25 @@ const _BASIC_RUST_TYPE: [&'static str; 12] = [
     "c_void", "c_char", "f32", "f64", "u8", "u16", "u32", "u64", "i32", "i64", "usize", "i32",
 ];
 
-fn main() {
+fn main() -> std::io::Result<()> {
     let path = std::env::args().nth(1).unwrap_or(String::from("vk.xml"));
     match std::fs::read_to_string(&path) {
         Ok(source) => match roxmltree::Document::parse(&source) {
-            Ok(registry) => process(registry),
+            Ok(registry) => process(registry)?,
             Err(e) => eprintln!("Failed to parse Vulkan XML registry!\n{}", e),
         },
         Err(e) => eprintln!(
             "Could not read Vulkan XML registry at path `{}`!\n{}",
             path, e
         ),
-    }
+    };
+
+    Ok(())
 }
 
-fn process(registry: roxmltree::Document) {
+fn process(registry: roxmltree::Document) -> std::io::Result<()> {
     let root = registry.root_element();
-    let mut enums = generate_enums(&root);
+    let mut enums = generate_enums(&root).unwrap();
 
     for child in root.children() {
         if child.is_element() {
@@ -33,10 +35,11 @@ fn process(registry: roxmltree::Document) {
                     if let Some(e) = enums.iter_mut().find(|e| e.name == name) {
                         generate_variants(e, &child);
                     } else {
-                        let e = Enum {
+                        let mut e = Enum {
                             name,
                             enumerants: Vec::new(),
                         };
+                        generate_variants(&mut e, &child);
                         enums.push(e);
                     }
                 } else {
@@ -69,62 +72,69 @@ fn process(registry: roxmltree::Document) {
         }
     }
 
+    let mut writer = std::io::BufWriter::new(std::io::stdout());
+    write_enums(enums, &mut writer)
+}
+
+fn write_enums<W: std::io::Write>(enums: Vec<Enum>, w: &mut W) -> std::io::Result<()> {
     let mut buffer = String::with_capacity(256);
 
-    println!("use std::{{ffi::c_void, os::raw::c_char}};\n");
+    writeln!(w, "use std::{{ffi::c_void, os::raw::c_char}};\n")?;
     for e in enums {
         vk2rt(e.name, &mut buffer);
 
-        println!("#[derive(Clone, Copy, Debug)]");
-        println!("#[repr(C)]");
-        println!("pub enum {} {{", buffer);
-        vk2rv(e.name, &e.enumerants);
-        println!("}}\n");
+        writeln!(w, "#[derive(Clone, Copy, Debug)]")?;
+        writeln!(w, "#[repr(C)]")?;
+        writeln!(w, "pub enum {} {{", buffer)?;
+        vk2rv(e.name, &e.enumerants, w)?;
+        writeln!(w, "}}\n")?;
 
         buffer.clear();
     }
+
+    Ok(())
 }
 
-fn generate_enums<'r, 's>(root: &'r roxmltree::Node<'s, 's>) -> Vec<Enum<'s>> {
+fn generate_enums<'r, 's>(root: &'r roxmltree::Node<'s, 's>) -> Option<Vec<Enum<'s>>> {
+    let mut result = None;
+
     for child in root.children() {
         if child.is_element() {
             let name = child.tag_name().name();
             if name == "types" {
-                return types_path(&child);
+                result = Some(types_path(&child));
+                break;
             }
         }
     }
 
-    panic!("No types found!");
+    result
 }
 
 fn generate_variants<'b, 'n>(e: &'b mut Enum<'n>, node: &'b roxmltree::Node<'n, 'n>) {
     for child in node.children() {
         let name = child.tag_name().name();
         if child.is_element() && (name == "enum") {
-            let name = child
-                .attribute("name")
-                .map(|s| String::from(s).into_boxed_str())
-                .unwrap_or(String::from("UnknownEnumerant").into_boxed_str());
+            let name = child.attribute("name").unwrap_or("UnknownEnumerant");
 
             if let Some(value) = child.attribute("value") {
                 let enumerant = Enumerant {
                     name,
-                    value: String::from(value).into_boxed_str(),
+                    value: EnumerantValue::Integer(value),
                 };
                 e.enumerants.push(enumerant);
             } else if let Some(bitpos) = child.attribute("bitpos") {
                 if let Ok(bitpos) = bitpos.parse::<u32>() {
                     let enumerant = Enumerant {
                         name,
-                        value: format!("{:X}", 0x1 << bitpos).into_boxed_str(),
+                        value: EnumerantValue::BitPos(bitpos),
                     };
                     e.enumerants.push(enumerant);
                 }
             } else if let Some(alias) = child.attribute("alias") {
                 let enumerant = Enumerant {
                     name,
-                    value: String::from(alias).into_boxed_str(),
+                    value: EnumerantValue::Alias(alias),
                 };
                 e.enumerants.push(enumerant);
             } else if let Some(_offset) = child.attribute("offset") {
@@ -142,19 +152,13 @@ fn vk2rt(vk_name: &str, buffer: &mut String) {
 }
 
 /// Convert a Vulkan enumeration variant to a Rust-style enumeration variant.
-fn vk2rv(name: &str, variants: &[Enumerant]) {
+fn vk2rv<W: std::io::Write>(name: &str, variants: &[Enumerant], w: &mut W) -> std::io::Result<()> {
     if variants.len() == 0 {
-        return;
+        return Ok(());
     }
 
     let mut prefix = Vec::with_capacity(128);
-
-    // Copy `Vk` and turn it into 'VK'
-    prefix.extend(
-        name.bytes()
-            .take(2)
-            .map(|b| (b as char).to_ascii_uppercase() as u8),
-    );
+    prefix.extend_from_slice(b"VK");
     cc2ssc(&mut prefix, name.bytes().skip(2));
 
     // Append / so we pick up the end of the name and stop matching
@@ -162,40 +166,56 @@ fn vk2rv(name: &str, variants: &[Enumerant]) {
 
     // Working buffer
     let mut buffer = Vec::with_capacity(128);
-    variants
-        .iter()
-        .for_each(|v| {
-            let prefix_index = prefix.iter().zip(v.name.bytes()).position(|(&l, r)| l != r);
+    for v in variants {
+        buffer.extend_from_slice(b"    ");
 
-            match prefix_index {
-                Some(0) | None => {
-                    eprintln!(
-                        "Unable to find common prefix in {} -> {:?}",
-                        name,
-                        std::str::from_utf8(&prefix)
-                    );
-                }
-                Some(x) => {
-                    let suffixes = [
-                        "_BIT_ANDROID",
-                        "_BIT",
-                        "_BIT_EXT",
-                        "_BIT_KHR",
-                        "_EXT",
-                        "_NV",
-                        "_KHR",
-                    ];
-                    let trimmed = trim_suffix(&v.name[x..], &suffixes);
-                    ssc2cc(&mut buffer, trimmed.bytes());
+        if let EnumerantValue::Alias(_) = v.value {
+            // Enums cannot have duplicate discriminants so we comment out aliases
+            buffer.extend_from_slice(b"// ");
+        }
 
-                    let name = std::str::from_utf8(&buffer)
-                        .expect("Enum variant conversion resulted in non-UTF-8 output!");
+        // TODO: Individual variants could have the suffix but it could be the case that it is not
+        // shared across all variants. This means that we cannot strip it.
+        let name = strip_prefix(v.name, &prefix).unwrap_or(v.name);
+        ssc2cc(&mut buffer, name.bytes());
 
-                    println!("    {} = {}", name, v.value);
-                    buffer.clear();
+        buffer.extend_from_slice(b" = ");
+        if let EnumerantValue::Alias(alias) = v.value {
+            let alias = strip_prefix(alias, &prefix).unwrap_or(alias);
+            ssc2cc(&mut buffer, alias.bytes());
+        } else {
+            use std::io::Write;
+            // NOTE: Need to write formatted output since we do a conversion for bit-position based
+            // enums.
+            write!(&mut buffer, "{}", v.value)?;
+        }
+
+        buffer.extend_from_slice(b",\n");
+        w.write_all(&buffer)?;
+
+        buffer.clear();
+    }
+
+    Ok(())
+}
+
+fn strip_prefix<'i>(name: &'i str, prefix: &'i [u8]) -> Option<&'i str> {
+    let prefix_index = prefix.iter().zip(name.bytes()).position(|(&l, r)| l != r);
+
+    match prefix_index {
+        Some(0) | None => None,
+        Some(mut x) => {
+            // Must limit match to a word boundary. In this case, a word boundary is `_` since
+            // we're still working with a SCREAMING_SNAKE_CASE name.
+            if !name.get(x..)?.starts_with('_') {
+                if let Some(boundary) = name.get(..x)?.rfind('_') {
+                    x = boundary;
                 }
             }
-        })
+
+            name.get(x..)
+        }
+    }
 }
 
 fn types_path<'b, 'i>(types: &'b roxmltree::Node<'i, 'i>) -> Vec<Enum<'i>> {
@@ -243,13 +263,30 @@ fn types_path<'b, 'i>(types: &'b roxmltree::Node<'i, 'i>) -> Vec<Enum<'i>> {
 
 struct Enum<'e> {
     name: &'e str,
-    enumerants: Vec<Enumerant>,
+    enumerants: Vec<Enumerant<'e>>,
 }
 
 #[derive(Clone, Debug)]
-struct Enumerant {
-    name: Box<str>,
-    value: Box<str>,
+struct Enumerant<'e> {
+    name: &'e str,
+    value: EnumerantValue<'e>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum EnumerantValue<'v> {
+    Alias(&'v str),
+    BitPos(u32),
+    Integer(&'v str),
+}
+
+impl std::fmt::Display for EnumerantValue<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Alias(a) => write!(f, "{}", a),
+            Self::BitPos(b) => write!(f, "{:X}", 0x1 << b),
+            Self::Integer(i) => write!(f, "{}", i),
+        }
+    }
 }
 
 /// Convert an iterator over bytes, `B`, from CamelCase to SCREAMING_SNAKE_CASE storing it in
