@@ -11,3 +11,6 @@ roxmltree = "0.14.1"
 
 [profile.dev]
 opt-level = 1
+
+[profile.release]
+lto = true

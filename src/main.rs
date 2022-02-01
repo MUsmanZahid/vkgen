@@ -24,7 +24,7 @@ fn main() -> std::io::Result<()> {
 
 fn process(registry: roxmltree::Document) -> std::io::Result<()> {
     let root = registry.root_element();
-    let mut enums = generate_enums(&root).unwrap();
+    let mut enums = generate_enums(&root);
 
     for child in root.children() {
         if child.is_element() {
@@ -46,25 +46,10 @@ fn process(registry: roxmltree::Document) -> std::io::Result<()> {
                     eprintln!("Unnamed enum found!");
                 }
             } else if name == "extensions" {
-                for e in child.children() {
-                    if e.is_element() {
-                        if let Some(name) = e.attribute("name") {
-                            eprintln!("{} extension found!", name);
-                            for ext in e.children() {
-                                if ext.is_element() {
-                                    let name = ext.tag_name().name();
-                                    if name == "require" {
-                                        for req in ext.children() {
-                                            let name = req.tag_name().name();
-                                            eprintln!("\t{}", name);
-                                        }
-                                    } else if name == "remove" {
-                                        eprintln!("\tRemove request");
-                                    }
-                                }
-                            }
-                        } else {
-                            eprintln!("Unnamed extension found!");
+                for item in child.children() {
+                    if item.is_element() {
+                        if item.tag_name().name() == "extension" {
+                            // generate_extension(&item);
                         }
                     }
                 }
@@ -74,6 +59,30 @@ fn process(registry: roxmltree::Document) -> std::io::Result<()> {
 
     let mut writer = std::io::BufWriter::new(std::io::stdout());
     write_enums(enums, &mut writer)
+}
+
+fn generate_extension<'i>(ext: &roxmltree::Node<'i, 'i>) {
+    if let Some(name) = ext.attribute("name") {
+        eprint!("{} ", name);
+    } else {
+        eprint!("Unknown extension ");
+    }
+
+    for e in ext.children() {
+        if e.is_element() {
+            let name = e.tag_name().name();
+            if name == "require" {
+                eprint!("requires ");
+            } else if name == "remove" {
+                eprint!("removes ");
+            }
+
+            for item in e.children() {
+                eprint!("{} ", item.tag_name().name());
+            }
+            eprintln!();
+        }
+    }
 }
 
 fn write_enums<W: std::io::Write>(enums: Vec<Enum>, w: &mut W) -> std::io::Result<()> {
@@ -95,20 +104,81 @@ fn write_enums<W: std::io::Write>(enums: Vec<Enum>, w: &mut W) -> std::io::Resul
     Ok(())
 }
 
-fn generate_enums<'r, 's>(root: &'r roxmltree::Node<'s, 's>) -> Option<Vec<Enum<'s>>> {
-    let mut result = None;
+fn generate_enums<'r, 's>(root: &'r roxmltree::Node<'s, 's>) -> Vec<Enum<'s>> {
+    let mut enums = Vec::new();
 
     for child in root.children() {
         if child.is_element() {
-            let name = child.tag_name().name();
-            if name == "types" {
-                result = Some(types_path(&child));
-                break;
+            if child.tag_name().name() == "types" {
+                for t in child.descendants() {
+                    if t.is_element() {
+                        let attributes = t.attribute("category").zip(t.attribute("name"));
+                        if let Some((category, name)) = attributes {
+                            match category {
+                                "enum" => {
+                                    let e = Enum {
+                                        name,
+                                        enumerants: Vec::new(),
+                                    };
+                                    enums.push(e);
+                                }
+                                "struct" => generate_struct(name, &t),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 
-    result
+    enums
+}
+
+fn generate_struct<'i>(name: &str, structure: &roxmltree::Node<'i, 'i>) {
+    let mut buffer = String::with_capacity(128);
+    buffer.push_str("#[derive(Clone, Copy)]\n");
+    buffer.push_str("#[repr(C)]\n");
+    buffer.push_str("struct ");
+    buffer.push_str(name);
+    buffer.push_str(" {");
+
+    let mut type_buffer = String::with_capacity(128);
+
+    for c in structure.children() {
+        if c.is_element() {
+            if c.tag_name().name() == "member" {
+                buffer.push_str("\n   ");
+                for m in c.children() {
+                    if m.is_element() || m.is_text() {
+                        let name = m.tag_name().name();
+                        if name != "comment" {
+                            if let Some(text) = m.text() {
+                                let text = text.trim();
+                                if !text.is_empty() {
+                                    let b = if name == "name" {
+                                        &mut buffer
+                                    } else {
+                                        &mut type_buffer
+                                    };
+
+                                    b.push(' ');
+                                    b.push_str(text);
+                                }
+                            }
+                        }
+                    }
+                }
+                buffer.push(':');
+                buffer.push_str(&type_buffer);
+                buffer.push(',');
+                type_buffer.clear();
+            }
+        }
+    }
+
+    buffer.push_str("\n}\n");
+    eprintln!("{}", buffer);
 }
 
 fn generate_variants<'b, 'n>(e: &'b mut Enum<'n>, node: &'b roxmltree::Node<'n, 'n>) {
@@ -216,49 +286,6 @@ fn strip_prefix<'i>(name: &'i str, prefix: &'i [u8]) -> Option<&'i str> {
             name.get(x..)
         }
     }
-}
-
-fn types_path<'b, 'i>(types: &'b roxmltree::Node<'i, 'i>) -> Vec<Enum<'i>> {
-    let mut enums = Vec::with_capacity(256);
-
-    if let Some(comment) = types.attribute("comment") {
-        eprintln!("{}", comment);
-    }
-
-    for vk_type in types.descendants() {
-        if vk_type.is_element() {
-            if let Some(category) = vk_type.attribute("category") {
-                if (category == "include") || (category == "define") {
-                    continue;
-                }
-            }
-
-            if let Some(name) = vk_type.attribute("name") {
-                if let Some("enum") = vk_type.attribute("category") {
-                    let e = Enum {
-                        name,
-                        enumerants: Vec::new(),
-                    };
-                    enums.push(e);
-                } else {
-                    eprint!("{}: ", name);
-                    for attribute in vk_type.attributes() {
-                        eprint!("({}, {}), ", attribute.name(), attribute.value());
-                    }
-
-                    if let Some(text) = vk_type.text() {
-                        if !text.chars().all(char::is_whitespace) {
-                            eprintln!("{}", text);
-                        }
-                    } else {
-                        eprintln!();
-                    }
-                }
-            }
-        }
-    }
-
-    enums
 }
 
 struct Enum<'e> {
