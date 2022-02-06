@@ -1,13 +1,15 @@
-const _BASIC_C_TYPE: [&'static str; 12] = [
+const BASIC_C_TYPE: [&str; 12] = [
     "void", "char", "float", "double", "uint8_t", "uint16_t", "uint32_t", "uint64_t", "int32_t",
     "int64_t", "size_t", "int",
 ];
-const _BASIC_RUST_TYPE: [&'static str; 12] = [
+const BASIC_RUST_TYPE: [&str; 12] = [
     "c_void", "c_char", "f32", "f64", "u8", "u16", "u32", "u64", "i32", "i64", "usize", "i32",
 ];
 
 fn main() -> std::io::Result<()> {
-    let path = std::env::args().nth(1).unwrap_or(String::from("vk.xml"));
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| String::from("vk.xml"));
     match std::fs::read_to_string(&path) {
         Ok(source) => match roxmltree::Document::parse(&source) {
             Ok(registry) => process(registry)?,
@@ -61,7 +63,7 @@ fn process(registry: roxmltree::Document) -> std::io::Result<()> {
     write_enums(enums, &mut writer)
 }
 
-fn generate_extension<'i>(ext: &roxmltree::Node<'i, 'i>) {
+fn _generate_extension<'i>(ext: &roxmltree::Node<'i, 'i>) {
     if let Some(name) = ext.attribute("name") {
         eprint!("{} ", name);
     } else {
@@ -169,6 +171,10 @@ fn generate_struct<'i>(name: &str, structure: &roxmltree::Node<'i, 'i>) {
                         }
                     }
                 }
+
+                let tokens = tokenize_c_type(&type_buffer);
+                ct2rt(tokens);
+
                 buffer.push(':');
                 buffer.push_str(&type_buffer);
                 buffer.push(',');
@@ -178,7 +184,146 @@ fn generate_struct<'i>(name: &str, structure: &roxmltree::Node<'i, 'i>) {
     }
 
     buffer.push_str("\n}\n");
-    eprintln!("{}", buffer);
+    // eprintln!("{}", buffer);
+}
+
+/// Convert a list of C tokens to a Rust type.
+fn ct2rt(tokens: Vec<CToken>) {
+    eprint!("C Tokens -> Rust: ");
+
+    if tokens.len() == 1 {
+        if let Some(CToken::Identifier(identifier)) = tokens.first() {
+            let mut buffer = String::with_capacity(64);
+            vk2rt(identifier, &mut buffer);
+            eprintln!("{}", buffer);
+        }
+    } else if tokens.iter().any(|t| *t == CToken::Colon) {
+        eprintln!("Cannot emit bitfield!");
+    } else if tokens.iter().any(|t| *t == CToken::BracketLeft) {
+        // Array
+        eprintln!("TODO Array");
+    } else {
+        // Pointers
+        let search = tokens.iter().find(|t| matches!(t, CToken::Identifier(_)));
+        if let Some(CToken::Identifier(identifier)) = search {
+            let mut seen_pointer = false;
+            for (i, t) in tokens.iter().enumerate().rev() {
+                if seen_pointer {
+                    if *t == CToken::Qualifier(CQualifier::Const) {
+                        eprint!("*const ");
+                        seen_pointer = false;
+                    } else if (*t == CToken::Pointer) || (i == 0) {
+                        // `**` or _ * so we must append mut to the pointer we have already seen
+                        // before
+                        eprint!("*mut ");
+                    }
+                } else {
+                    seen_pointer = *t == CToken::Pointer;
+                }
+            }
+
+            let mut buffer = String::with_capacity(64);
+            vk2rt(identifier, &mut buffer);
+            eprintln!("{}", buffer);
+        }
+    }
+}
+
+fn tokenize_c_type(mut t: &str) -> Vec<CToken> {
+    t = t.trim();
+
+    let mut tokens = Vec::with_capacity(64);
+    for split in t.split_whitespace() {
+        if let CToken::TokenList(_) = CToken::from(split) {
+            if !split.is_empty() {
+                let mut start = 0;
+                for (end, c) in split.chars().enumerate() {
+                    if CToken::is_basic(c) {
+                        // We were tracking prior token before encountering this basic one so add
+                        // that first.
+                        if start < end {
+                            if let Some(s) = split.get(start..end) {
+                                tokens.push(CToken::from(s));
+                            }
+                        }
+
+                        // Add the basic token we just encountered
+                        tokens.push(CToken::from(c));
+                        start = end + 1;
+                    } else if end + 1 == split.len() {
+                        if let Some(s) = split.get(start..end + 1) {
+                            tokens.push(CToken::from(s));
+                        }
+                    }
+                }
+            }
+        } else {
+            tokens.push(CToken::from(split));
+        }
+    }
+
+    tokens
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CToken<'t> {
+    BracketLeft,
+    BracketRight,
+    Colon,
+    Identifier(&'t str),
+    Literal(&'t str),
+    Pointer,
+    Qualifier(CQualifier),
+    TokenList(&'t str),
+}
+
+impl<'t> CToken<'t> {
+    pub fn is_basic(c: char) -> bool {
+        (c == '[') || (c == ']') || (c == ':') || (c == '*')
+    }
+}
+
+impl<'t> From<char> for CToken<'t> {
+    fn from(c: char) -> Self {
+        match c {
+            '[' => CToken::BracketLeft,
+            ']' => CToken::BracketRight,
+            ':' => CToken::Colon,
+            '*' => CToken::Pointer,
+            _ => panic!("Unknown basic token '{}'", c),
+        }
+    }
+}
+
+impl<'s> From<&'s str> for CToken<'s> {
+    fn from(s: &'s str) -> Self {
+        match s {
+            "[" => CToken::BracketLeft,
+            "]" => CToken::BracketRight,
+            ":" => CToken::Colon,
+            "*" => CToken::Pointer,
+            "const" => CToken::Qualifier(CQualifier::Const),
+            "volatile" => CToken::Qualifier(CQualifier::Volatile),
+            i => {
+                // NOTE: We assume that the tokens have been split on whitespace so the only
+                // thing a token tree can contain is a mix of identifier and pointers which were
+                // not space-separated.
+                if i.contains(|c| (c == '[') || (c == ']') || (c == ':') || (c == '*')) {
+                    CToken::TokenList(i)
+                } else if i.bytes().all(|b| b.is_ascii_digit()) {
+                    CToken::Literal(i)
+                } else {
+                    CToken::Identifier(i)
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CQualifier {
+    Const,
+    Volatile,
 }
 
 fn generate_variants<'b, 'n>(e: &'b mut Enum<'n>, node: &'b roxmltree::Node<'n, 'n>) {
@@ -218,12 +363,18 @@ fn generate_variants<'b, 'n>(e: &'b mut Enum<'n>, node: &'b roxmltree::Node<'n, 
 
 /// Convert a Vulkan type to a Rust type
 fn vk2rt(vk_name: &str, buffer: &mut String) {
-    buffer.extend(vk_name.chars().skip(2))
+    if let Some(i) = BASIC_C_TYPE.iter().position(|c| *c == vk_name) {
+        if let Some(rtype) = BASIC_RUST_TYPE.get(i) {
+            buffer.extend(rtype.chars());
+        }
+    } else {
+        buffer.extend(vk_name.chars().skip(2))
+    }
 }
 
 /// Convert a Vulkan enumeration variant to a Rust-style enumeration variant.
 fn vk2rv<W: std::io::Write>(name: &str, variants: &[Enumerant], w: &mut W) -> std::io::Result<()> {
-    if variants.len() == 0 {
+    if variants.is_empty() {
         return Ok(());
     }
 
@@ -310,7 +461,7 @@ impl std::fmt::Display for EnumerantValue<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Alias(a) => write!(f, "{}", a),
-            Self::BitPos(b) => write!(f, "{:X}", 0x1 << b),
+            Self::BitPos(b) => write!(f, "0x{:X}", 0x1 << b),
             Self::Integer(i) => write!(f, "{}", i),
         }
     }
@@ -351,15 +502,15 @@ where
     }
 }
 
-fn trim_suffix<'t>(s: &'t str, suffixes: &'t [&str]) -> &'t str {
+fn _trim_suffix<'t>(s: &'t str, suffixes: &'t [&str]) -> &'t str {
     if let Some(suffix) = suffixes.iter().find(|&&suffix| s.ends_with(suffix)) {
         if suffix.len() < s.len() {
             let y = s.len() - suffix.len();
             &s[..y]
         } else {
-            &s
+            s
         }
     } else {
-        &s
+        s
     }
 }
