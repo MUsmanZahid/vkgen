@@ -189,11 +189,11 @@ fn generate_struct<'i>(name: &str, structure: &roxmltree::Node<'i, 'i>) {
 
 /// Convert a list of C tokens to a Rust type.
 fn ct2rt(tokens: Vec<CToken>) {
+    let mut buffer = String::with_capacity(64);
     eprint!("C Tokens -> Rust: ");
 
     if tokens.len() == 1 {
         if let Some(CToken::Identifier(identifier)) = tokens.first() {
-            let mut buffer = String::with_capacity(64);
             vk2rt(identifier, &mut buffer);
             eprintln!("{}", buffer);
         }
@@ -201,7 +201,25 @@ fn ct2rt(tokens: Vec<CToken>) {
         eprintln!("Cannot emit bitfield!");
     } else if tokens.iter().any(|t| *t == CToken::BracketLeft) {
         // Array
-        eprintln!("TODO Array");
+        let search = tokens.iter().find(|t| matches!(t, CToken::Identifier(_)));
+        if let Some(CToken::Identifier(identifier)) = search {
+            let mut stack = Vec::with_capacity(8);
+            for t in tokens.iter() {
+                if let CToken::Literal(l) = t {
+                    stack.push(l);
+                }
+            }
+
+            vk2rt(identifier, &mut buffer);
+            for _ in 0..stack.len() {
+                eprint!("[");
+            }
+            eprint!("{}", buffer);
+            for length in stack.into_iter().rev() {
+                eprint!("; {}]", length);
+            }
+            eprintln!();
+        }
     } else {
         // Pointers
         let search = tokens.iter().find(|t| matches!(t, CToken::Identifier(_)));
@@ -213,8 +231,8 @@ fn ct2rt(tokens: Vec<CToken>) {
                         eprint!("*const ");
                         seen_pointer = false;
                     } else if (*t == CToken::Pointer) || (i == 0) {
-                        // `**` or _ * so we must append mut to the pointer we have already seen
-                        // before
+                        // `**` or <identifier> * so we must append mut to the pointer we have
+                        // already seen before
                         eprint!("*mut ");
                     }
                 } else {
@@ -222,7 +240,6 @@ fn ct2rt(tokens: Vec<CToken>) {
                 }
             }
 
-            let mut buffer = String::with_capacity(64);
             vk2rt(identifier, &mut buffer);
             eprintln!("{}", buffer);
         }
@@ -367,8 +384,27 @@ fn vk2rt(vk_name: &str, buffer: &mut String) {
         if let Some(rtype) = BASIC_RUST_TYPE.get(i) {
             buffer.extend(rtype.chars());
         }
+    } else if vk_name.starts_with("Vk") {
+        // Find consecutive capitals at the end of the type name, e.g. `EXT`, `KHR`, `NV`, etc.
+        // and convert them to CamelCase
+        let mut ncaps = 0;
+        for b in vk_name.bytes().rev() {
+            if b.is_ascii_uppercase() {
+                ncaps += 1;
+            } else {
+                break;
+            }
+        }
+
+        let len = vk_name.len();
+        if (ncaps > 1) && (ncaps <= len - 2) {
+            buffer.extend(vk_name.chars().skip(2).take(len - ncaps - 2));
+            c2cc(buffer, vk_name.chars().skip(len - ncaps))
+        } else {
+            buffer.extend(vk_name.chars().skip(2));
+        }
     } else {
-        buffer.extend(vk_name.chars().skip(2))
+        buffer.extend(vk_name.chars());
     }
 }
 
@@ -464,6 +500,16 @@ impl std::fmt::Display for EnumerantValue<'_> {
             Self::BitPos(b) => write!(f, "0x{:X}", 0x1 << b),
             Self::Integer(i) => write!(f, "{}", i),
         }
+    }
+}
+
+fn c2cc<B>(buffer: &mut String, mut name: B)
+where
+    B: Iterator<Item = char>,
+{
+    if let Some(b) = name.next() {
+        buffer.push(b);
+        buffer.extend(name.map(|b| b.to_ascii_lowercase()))
     }
 }
 
