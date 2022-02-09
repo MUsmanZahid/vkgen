@@ -1,5 +1,7 @@
 /target
-dump.txt
+.idea
+.vs
+.vscode
 vk.rs
 vk.xml
 Cargo.lock

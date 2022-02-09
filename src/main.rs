@@ -49,10 +49,8 @@ fn process(registry: roxmltree::Document) -> std::io::Result<()> {
                 }
             } else if name == "extensions" {
                 for item in child.children() {
-                    if item.is_element() {
-                        if item.tag_name().name() == "extension" {
-                            // generate_extension(&item);
-                        }
+                    if item.is_element() && (item.tag_name().name() == "extension") {
+                        // generate_extension(&item);
                     }
                 }
             }
@@ -63,7 +61,7 @@ fn process(registry: roxmltree::Document) -> std::io::Result<()> {
     write_enums(enums, &mut writer)
 }
 
-fn _generate_extension<'i>(ext: &roxmltree::Node<'i, 'i>) {
+fn _generate_extension(ext: &roxmltree::Node) {
     if let Some(name) = ext.attribute("name") {
         eprint!("{} ", name);
     } else {
@@ -88,7 +86,7 @@ fn _generate_extension<'i>(ext: &roxmltree::Node<'i, 'i>) {
 }
 
 fn write_enums<W: std::io::Write>(enums: Vec<Enum>, w: &mut W) -> std::io::Result<()> {
-    let mut buffer = String::with_capacity(256);
+    let mut buffer = Vec::with_capacity(256);
 
     writeln!(w, "use std::{{ffi::c_void, os::raw::c_char}};\n")?;
     for e in enums {
@@ -96,7 +94,9 @@ fn write_enums<W: std::io::Write>(enums: Vec<Enum>, w: &mut W) -> std::io::Resul
 
         writeln!(w, "#[derive(Clone, Copy, Debug)]")?;
         writeln!(w, "#[repr(C)]")?;
-        writeln!(w, "pub enum {} {{", buffer)?;
+        write!(w, "pub enum ")?;
+        w.write_all(&buffer)?;
+        writeln!(w, "{{")?;
         vk2rv(e.name, &e.enumerants, w)?;
         writeln!(w, "}}\n")?;
 
@@ -107,29 +107,50 @@ fn write_enums<W: std::io::Write>(enums: Vec<Enum>, w: &mut W) -> std::io::Resul
 }
 
 fn generate_enums<'r, 's>(root: &'r roxmltree::Node<'s, 's>) -> Vec<Enum<'s>> {
-    let mut enums = Vec::new();
+    use std::io::Write;
 
-    for child in root.children() {
-        if child.is_element() {
-            if child.tag_name().name() == "types" {
-                for t in child.descendants() {
-                    if t.is_element() {
-                        let attributes = t.attribute("category").zip(t.attribute("name"));
-                        if let Some((category, name)) = attributes {
-                            match category {
-                                "enum" => {
-                                    let e = Enum {
-                                        name,
-                                        enumerants: Vec::new(),
-                                    };
-                                    enums.push(e);
-                                }
-                                "struct" => generate_struct(name, &t),
-                                _ => {}
-                            }
+    let stdout = std::io::stdout();
+    let mut stdout_locked = stdout.lock();
+
+    let mut enums = Vec::new();
+    let mut structure = Vec::with_capacity(4096);
+
+    let elements = root
+        .children()
+        .filter(|child| child.is_element() && (child.tag_name().name() == "types"))
+        .flat_map(|t| t.descendants().filter(|t| t.is_element()))
+        .filter_map(|e| {
+            Some(e)
+                .zip(e.attribute("category").zip(e.attribute("name")))
+                .map(|(e, (c, n))| (e, c, n))
+        });
+
+    for (node, category, name) in elements {
+        if let Some(alias) = node.attribute("alias") {
+            structure.extend_from_slice(b"pub type ");
+            vk2rt(name, &mut structure);
+            structure.extend_from_slice(b" = ");
+            vk2rt(alias, &mut structure);
+            structure.extend_from_slice(b";\n\n");
+        } else {
+            match category {
+                "enum" => {
+                    let e = Enum {
+                        name,
+                        enumerants: Vec::new(),
+                    };
+                    enums.push(e);
+                }
+                "struct" => {
+                    if generate_struct(&mut structure, name, &node) {
+                        structure.push(b'\n');
+                        if let Err(e) = stdout_locked.write_all(&structure) {
+                            eprintln!("Failed to write {}:\n{}", name, e);
                         }
                     }
+                    structure.clear();
                 }
+                _ => {}
             }
         }
     }
@@ -137,72 +158,83 @@ fn generate_enums<'r, 's>(root: &'r roxmltree::Node<'s, 's>) -> Vec<Enum<'s>> {
     enums
 }
 
-fn generate_struct<'i>(name: &str, structure: &roxmltree::Node<'i, 'i>) {
-    let mut buffer = String::with_capacity(128);
-    buffer.push_str("#[derive(Clone, Copy)]\n");
-    buffer.push_str("#[repr(C)]\n");
-    buffer.push_str("struct ");
-    buffer.push_str(name);
-    buffer.push_str(" {");
+// TODO: Some structures are aliases so we must create a type definition for them instead of
+// generating a full structure.
+fn generate_struct(buffer: &mut Vec<u8>, name: &str, structure: &roxmltree::Node) -> bool {
+    // Do not emit these placeholder structures
+    if (name == "VkBaseInStructure") || (name == "VkBaseOutStructure") {
+        return false;
+    }
+
+    buffer.extend_from_slice(b"#[derive(Clone, Copy)]\n");
+    buffer.extend_from_slice(b"#[repr(C)]\n");
+    buffer.extend_from_slice(b"pub struct ");
+    vk2rt(name, buffer);
+    buffer.extend_from_slice(b" {");
 
     let mut type_buffer = String::with_capacity(128);
 
-    for c in structure.children() {
-        if c.is_element() {
-            if c.tag_name().name() == "member" {
-                buffer.push_str("\n   ");
-                for m in c.children() {
-                    if m.is_element() || m.is_text() {
-                        let name = m.tag_name().name();
-                        if name != "comment" {
-                            if let Some(text) = m.text() {
-                                let text = text.trim();
-                                if !text.is_empty() {
-                                    let b = if name == "name" {
-                                        &mut buffer
-                                    } else {
-                                        &mut type_buffer
-                                    };
+    let members = structure
+        .children()
+        .filter(|c| c.is_element() && (c.tag_name().name() == "member"));
+    for member in members {
+        buffer.extend_from_slice(b"\n   ");
 
-                                    b.push(' ');
-                                    b.push_str(text);
-                                }
-                            }
+        let children = member.children().filter(|c| c.is_element() || c.is_text());
+        for child in children {
+            let name = child.tag_name().name();
+            if name != "comment" {
+                if let Some(text) = child.text() {
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        if name == "name" {
+                            buffer.extend_from_slice(b" pub ");
+                            vk2rm(buffer, text);
+                        } else {
+                            type_buffer.push(' ');
+                            type_buffer.push_str(text);
                         }
                     }
                 }
-
-                let tokens = tokenize_c_type(&type_buffer);
-                ct2rt(tokens);
-
-                buffer.push(':');
-                buffer.push_str(&type_buffer);
-                buffer.push(',');
-                type_buffer.clear();
             }
         }
+
+        let tokens = tokenize_c_type(&type_buffer);
+        // Do not generate the struct if we have a member that is a bit-field.
+        if tokens.iter().any(|t| *t == CToken::Colon) {
+            return false;
+        }
+
+        buffer.extend_from_slice(b": ");
+        ct2rt(buffer, tokens);
+        buffer.push(b',');
+        type_buffer.clear();
     }
 
-    buffer.push_str("\n}\n");
-    // eprintln!("{}", buffer);
+    buffer.extend_from_slice(b"\n}\n");
+    true
 }
 
 /// Convert a list of C tokens to a Rust type.
-fn ct2rt(tokens: Vec<CToken>) {
-    let mut buffer = String::with_capacity(64);
-    eprint!("C Tokens -> Rust: ");
+fn ct2rt(buffer: &mut Vec<u8>, tokens: Vec<CToken>) {
+    let search = tokens
+        .iter()
+        .filter_map(|t| {
+            if let CToken::Identifier(s) = t {
+                Some(s)
+            } else {
+                None
+            }
+        })
+        .next();
 
-    if tokens.len() == 1 {
-        if let Some(CToken::Identifier(identifier)) = tokens.first() {
-            vk2rt(identifier, &mut buffer);
-            eprintln!("{}", buffer);
-        }
-    } else if tokens.iter().any(|t| *t == CToken::Colon) {
-        eprintln!("Cannot emit bitfield!");
-    } else if tokens.iter().any(|t| *t == CToken::BracketLeft) {
-        // Array
-        let search = tokens.iter().find(|t| matches!(t, CToken::Identifier(_)));
-        if let Some(CToken::Identifier(identifier)) = search {
+    if let Some(identifier) = search {
+        if tokens.len() == 1 {
+            vk2rt(identifier, buffer);
+        } else if tokens.iter().any(|t| *t == CToken::Colon) {
+            todo!("Bitfields!");
+        } else if tokens.iter().any(|t| *t == CToken::BracketLeft) {
+            // Array
             let mut stack = Vec::with_capacity(8);
             for t in tokens.iter() {
                 if let CToken::Literal(l) = t {
@@ -210,46 +242,42 @@ fn ct2rt(tokens: Vec<CToken>) {
                 }
             }
 
-            vk2rt(identifier, &mut buffer);
             for _ in 0..stack.len() {
-                eprint!("[");
+                buffer.push(b'[');
             }
-            eprint!("{}", buffer);
+            vk2rt(identifier, buffer);
             for length in stack.into_iter().rev() {
-                eprint!("; {}]", length);
+                buffer.extend_from_slice(b"; ");
+                buffer.extend_from_slice(length.as_bytes());
+                buffer.push(b']');
             }
-            eprintln!();
-        }
-    } else {
-        // Pointers
-        let search = tokens.iter().find(|t| matches!(t, CToken::Identifier(_)));
-        if let Some(CToken::Identifier(identifier)) = search {
+        } else {
+            // Pointers
             let mut seen_pointer = false;
             for (i, t) in tokens.iter().enumerate().rev() {
                 if seen_pointer {
                     if *t == CToken::Qualifier(CQualifier::Const) {
-                        eprint!("*const ");
+                        buffer.extend_from_slice(b"*const ");
                         seen_pointer = false;
                     } else if (*t == CToken::Pointer) || (i == 0) {
                         // `**` or <identifier> * so we must append mut to the pointer we have
                         // already seen before
-                        eprint!("*mut ");
+                        buffer.extend_from_slice(b"*mut ");
                     }
                 } else {
                     seen_pointer = *t == CToken::Pointer;
                 }
             }
 
-            vk2rt(identifier, &mut buffer);
-            eprintln!("{}", buffer);
+            vk2rt(identifier, buffer);
         }
     }
 }
 
 fn tokenize_c_type(mut t: &str) -> Vec<CToken> {
+    let mut tokens = Vec::with_capacity(64);
     t = t.trim();
 
-    let mut tokens = Vec::with_capacity(64);
     for split in t.split_whitespace() {
         if let CToken::TokenList(_) = CToken::from(split) {
             if !split.is_empty() {
@@ -344,45 +372,78 @@ enum CQualifier {
 }
 
 fn generate_variants<'b, 'n>(e: &'b mut Enum<'n>, node: &'b roxmltree::Node<'n, 'n>) {
-    for child in node.children() {
-        let name = child.tag_name().name();
-        if child.is_element() && (name == "enum") {
-            let name = child.attribute("name").unwrap_or("UnknownEnumerant");
+    let children = node
+        .children()
+        .filter(|c| c.is_element() && (c.tag_name().name() == "enum"));
+    for child in children {
+        let name = child.attribute("name").unwrap_or("UnknownEnumerant");
 
-            if let Some(value) = child.attribute("value") {
+        if let Some(value) = child.attribute("value") {
+            let enumerant = Enumerant {
+                name,
+                value: EnumerantValue::Integer(value),
+            };
+            e.enumerants.push(enumerant);
+        } else if let Some(bitpos) = child.attribute("bitpos") {
+            if let Ok(bitpos) = bitpos.parse::<u32>() {
                 let enumerant = Enumerant {
                     name,
-                    value: EnumerantValue::Integer(value),
+                    value: EnumerantValue::BitPos(bitpos),
                 };
                 e.enumerants.push(enumerant);
-            } else if let Some(bitpos) = child.attribute("bitpos") {
-                if let Ok(bitpos) = bitpos.parse::<u32>() {
-                    let enumerant = Enumerant {
-                        name,
-                        value: EnumerantValue::BitPos(bitpos),
-                    };
-                    e.enumerants.push(enumerant);
-                }
-            } else if let Some(alias) = child.attribute("alias") {
-                let enumerant = Enumerant {
-                    name,
-                    value: EnumerantValue::Alias(alias),
-                };
-                e.enumerants.push(enumerant);
-            } else if let Some(_offset) = child.attribute("offset") {
-                eprintln!("Enumerant with offset found!");
-            } else {
-                eprintln!("Enumerant {} has no value!", name);
             }
+        } else if let Some(alias) = child.attribute("alias") {
+            let enumerant = Enumerant {
+                name,
+                value: EnumerantValue::Alias(alias),
+            };
+            e.enumerants.push(enumerant);
+        } else if let Some(_offset) = child.attribute("offset") {
+            eprintln!("Enumerant with offset found!");
+        } else {
+            eprintln!("Enumerant {} has no value!", name);
         }
     }
 }
 
+/// Convert a Vulkan structure member name to a Rust structure member name
+fn vk2rm(buffer: &mut Vec<u8>, mut name: &str) {
+    if name == "sType" {
+        // Special case for `sType`. We cannot truncate to `type` since it is a Rust keyword so we
+        // keep the prefix and just change it to snake_case.
+        buffer.extend_from_slice(b"s_type");
+    } else {
+        // Do we have a Hungarian-notation prefix?
+        let mut lowers = 0;
+        for b in name.bytes() {
+            if b.is_ascii_lowercase() {
+                lowers += 1;
+            } else {
+                break;
+            }
+        }
+
+        if lowers > 0 {
+            if let Some(s) = name.get(lowers..) {
+                let prefixes = ["pp", "pfn"];
+                if !s.is_empty()
+                    && ((lowers == 1) || prefixes.iter().any(|&p| p == &name[..lowers]))
+                {
+                    name = s;
+                }
+            }
+        }
+
+        cc2sc(buffer, name);
+    }
+}
+
+// TODO: Handle case for types beginning with `PFN_vk`
 /// Convert a Vulkan type to a Rust type
-fn vk2rt(vk_name: &str, buffer: &mut String) {
+fn vk2rt(vk_name: &str, buffer: &mut Vec<u8>) {
     if let Some(i) = BASIC_C_TYPE.iter().position(|c| *c == vk_name) {
         if let Some(rtype) = BASIC_RUST_TYPE.get(i) {
-            buffer.extend(rtype.chars());
+            buffer.extend(rtype.bytes());
         }
     } else if vk_name.starts_with("Vk") {
         // Find consecutive capitals at the end of the type name, e.g. `EXT`, `KHR`, `NV`, etc.
@@ -398,13 +459,13 @@ fn vk2rt(vk_name: &str, buffer: &mut String) {
 
         let len = vk_name.len();
         if (ncaps > 1) && (ncaps <= len - 2) {
-            buffer.extend(vk_name.chars().skip(2).take(len - ncaps - 2));
-            c2cc(buffer, vk_name.chars().skip(len - ncaps))
+            buffer.extend(vk_name.bytes().skip(2).take(len - ncaps - 2));
+            c2cc(buffer, vk_name.bytes().skip(len - ncaps))
         } else {
-            buffer.extend(vk_name.chars().skip(2));
+            buffer.extend(vk_name.bytes().skip(2));
         }
     } else {
-        buffer.extend(vk_name.chars());
+        buffer.extend_from_slice(vk_name.as_bytes());
     }
 }
 
@@ -503,9 +564,10 @@ impl std::fmt::Display for EnumerantValue<'_> {
     }
 }
 
-fn c2cc<B>(buffer: &mut String, mut name: B)
+/// Convert an iterator over chars, B, from CAPS to CamelCase, storing it in `buffer`.
+fn c2cc<B>(buffer: &mut Vec<u8>, mut name: B)
 where
-    B: Iterator<Item = char>,
+    B: Iterator<Item = u8>,
 {
     if let Some(b) = name.next() {
         buffer.push(b);
@@ -526,6 +588,21 @@ where
         } else {
             buffer.push(c.to_ascii_uppercase() as u8);
         }
+    }
+}
+
+fn cc2sc(buffer: &mut Vec<u8>, name: &str) {
+    let mut was_upper = false;
+    for (i, c) in name.bytes().enumerate() {
+        if c.is_ascii_uppercase() {
+            if !was_upper && (i != 0) {
+                buffer.push(b'_');
+            }
+            was_upper = true;
+        } else {
+            was_upper = false;
+        }
+        buffer.push(c.to_ascii_lowercase());
     }
 }
 
