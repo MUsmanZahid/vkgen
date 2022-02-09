@@ -27,26 +27,11 @@ fn main() -> std::io::Result<()> {
 
 fn process(registry: roxmltree::Document) -> std::io::Result<()> {
     let root = registry.root_element();
-    let mut enums = generate_enums(&root);
+    generate_types(&root)?;
 
     for child in root.children().filter(|c| c.is_element()) {
         let name = child.tag_name().name();
-        if name == "enums" {
-            if let Some(name) = child.attribute("name") {
-                if let Some(e) = enums.iter_mut().find(|e| e.name == name) {
-                    generate_variants(e, &child);
-                } else {
-                    let mut e = Enum {
-                        name,
-                        enumerants: Vec::new(),
-                    };
-                    generate_variants(&mut e, &child);
-                    enums.push(e);
-                }
-            } else {
-                eprintln!("Unnamed enum found!");
-            }
-        } else if name == "extensions" {
+        if name == "extensions" {
             for item in child.children() {
                 if item.is_element() && (item.tag_name().name() == "extension") {
                     // generate_extension(&item);
@@ -55,8 +40,7 @@ fn process(registry: roxmltree::Document) -> std::io::Result<()> {
         }
     }
 
-    let mut writer = std::io::BufWriter::new(std::io::stdout());
-    write_enums(enums, &mut writer)
+    Ok(())
 }
 
 fn _generate_extension(ext: &roxmltree::Node) {
@@ -83,73 +67,67 @@ fn _generate_extension(ext: &roxmltree::Node) {
     }
 }
 
-fn write_enums<W: std::io::Write>(enums: Vec<Enum>, w: &mut W) -> std::io::Result<()> {
-    let mut buffer = Vec::with_capacity(256);
+fn generate_types(root: &roxmltree::Node) -> std::io::Result<()> {
+    use std::io::Write;
 
-    writeln!(w, "use std::{{ffi::c_void, os::raw::c_char}};\n")?;
-    for e in enums {
-        vk2rt(e.name, &mut buffer);
+    let stdout = std::io::stdout();
+    let mut stdout_locked = stdout.lock();
+    let mut buffer = Vec::with_capacity(4096);
 
-        writeln!(w, "#[derive(Clone, Copy, Debug)]")?;
-        writeln!(w, "#[repr(C)]")?;
-        write!(w, "pub enum ")?;
-        w.write_all(&buffer)?;
-        writeln!(w, "{{")?;
-        vk2rv(e.name, &e.enumerants, w)?;
-        writeln!(w, "}}\n")?;
-
+    let mut enumerants = Vec::with_capacity(128);
+    let enums = root
+        .children()
+        .filter(|child| child.is_element() && (child.tag_name().name() == "enums"))
+        .filter_map(|e| Some(e).zip(e.attribute("name")));
+    for (node, name) in enums {
+        generate_enum(&node, name, &mut enumerants, &mut buffer);
+        buffer.push(b'\n');
+        stdout_locked.write_all(&buffer)?;
         buffer.clear();
+        enumerants.clear();
+    }
+
+    let elements = root
+        .children()
+        .filter(|child| child.is_element() && (child.tag_name().name() == "types"))
+        .flat_map(|t| t.children().filter(|t| t.is_element()))
+        .filter_map(|e| Some(e).zip(e.attribute("category").zip(e.attribute("name"))));
+
+    for (node, (category, name)) in elements {
+        if let Some(alias) = node.attribute("alias") {
+            buffer.extend_from_slice(b"pub type ");
+            vk2rt(name, &mut buffer);
+            buffer.extend_from_slice(b" = ");
+            vk2rt(alias, &mut buffer);
+            buffer.extend_from_slice(b";\n\n");
+
+            stdout_locked.write_all(&buffer)?;
+            buffer.clear();
+        } else if (category == "struct") && generate_struct(&mut buffer, name, &node) {
+            buffer.push(b'\n');
+            stdout_locked.write_all(&buffer)?;
+            buffer.clear();
+        }
     }
 
     Ok(())
 }
 
-fn generate_enums<'r, 's>(root: &'r roxmltree::Node<'s, 's>) -> Vec<Enum<'s>> {
-    use std::io::Write;
+fn generate_enum<'e>(
+    node: &roxmltree::Node<'e, 'e>,
+    name: &'e str,
+    enumerants: &mut Vec<Enumerant<'e>>,
+    buffer: &mut Vec<u8>,
+) {
+    generate_variants(&node, enumerants);
 
-    let stdout = std::io::stdout();
-    let mut stdout_locked = stdout.lock();
-
-    let mut enums = Vec::new();
-    let mut structure = Vec::with_capacity(4096);
-
-    let elements = root
-        .children()
-        .filter(|child| child.is_element() && (child.tag_name().name() == "types"))
-        .flat_map(|t| t.descendants().filter(|t| t.is_element()))
-        .filter_map(|e| Some(e).zip(e.attribute("category").zip(e.attribute("name"))));
-
-    for (node, (category, name)) in elements {
-        if let Some(alias) = node.attribute("alias") {
-            structure.extend_from_slice(b"pub type ");
-            vk2rt(name, &mut structure);
-            structure.extend_from_slice(b" = ");
-            vk2rt(alias, &mut structure);
-            structure.extend_from_slice(b";\n\n");
-        } else {
-            match category {
-                "enum" => {
-                    let e = Enum {
-                        name,
-                        enumerants: Vec::new(),
-                    };
-                    enums.push(e);
-                }
-                "struct" => {
-                    if generate_struct(&mut structure, name, &node) {
-                        structure.push(b'\n');
-                        if let Err(e) = stdout_locked.write_all(&structure) {
-                            eprintln!("Failed to write {}:\n{}", name, e);
-                        }
-                    }
-                    structure.clear();
-                }
-                _ => {}
-            }
-        }
-    }
-
-    enums
+    buffer.extend_from_slice(b"#[derive(Clone, Copy, Debug)]\n");
+    buffer.extend_from_slice(b"#[repr(C)]\n");
+    buffer.extend_from_slice(b"pub enum ");
+    vk2rt(name, buffer);
+    buffer.extend_from_slice(b" {\n");
+    vk2rv(name, enumerants, buffer);
+    buffer.extend_from_slice(b"}\n");
 }
 
 fn generate_struct(buffer: &mut Vec<u8>, name: &str, structure: &roxmltree::Node) -> bool {
@@ -194,6 +172,7 @@ fn generate_struct(buffer: &mut Vec<u8>, name: &str, structure: &roxmltree::Node
         let tokens = tokenize_c_type(&type_buffer);
         // Do not generate the struct if we have a member that is a bit-field.
         if tokens.iter().any(|t| *t == CToken::Colon) {
+            buffer.clear();
             return false;
         }
 
@@ -363,7 +342,7 @@ enum CQualifier {
     Volatile,
 }
 
-fn generate_variants<'n>(e: &mut Enum<'n>, node: &roxmltree::Node<'n, 'n>) {
+fn generate_variants<'e>(node: &roxmltree::Node<'e, 'e>, enumerants: &mut Vec<Enumerant<'e>>) {
     let children = node
         .children()
         .filter(|c| c.is_element() && (c.tag_name().name() == "enum"));
@@ -375,21 +354,21 @@ fn generate_variants<'n>(e: &mut Enum<'n>, node: &roxmltree::Node<'n, 'n>) {
                 name,
                 value: EnumerantValue::Integer(value),
             };
-            e.enumerants.push(enumerant);
+            enumerants.push(enumerant);
         } else if let Some(bitpos) = child.attribute("bitpos") {
             if let Ok(bitpos) = bitpos.parse::<u32>() {
                 let enumerant = Enumerant {
                     name,
                     value: EnumerantValue::BitPos(bitpos),
                 };
-                e.enumerants.push(enumerant);
+                enumerants.push(enumerant);
             }
         } else if let Some(alias) = child.attribute("alias") {
             let enumerant = Enumerant {
                 name,
                 value: EnumerantValue::Alias(alias),
             };
-            e.enumerants.push(enumerant);
+            enumerants.push(enumerant);
         } else if let Some(_offset) = child.attribute("offset") {
             eprintln!("Enumerant with offset found!");
         } else {
@@ -452,7 +431,7 @@ fn vk2rt(vk_name: &str, buffer: &mut Vec<u8>) {
         let len = vk_name.len();
         if (ncaps > 1) && (ncaps <= len - 2) {
             buffer.extend(vk_name.bytes().skip(2).take(len - ncaps - 2));
-            c2cc(buffer, vk_name.bytes().skip(len - ncaps))
+            c2pc(buffer, vk_name.bytes().skip(len - ncaps))
         } else {
             buffer.extend(vk_name.bytes().skip(2));
         }
@@ -462,14 +441,14 @@ fn vk2rt(vk_name: &str, buffer: &mut Vec<u8>) {
 }
 
 /// Convert a Vulkan enumeration variant to a Rust-style enumeration variant.
-fn vk2rv<W: std::io::Write>(name: &str, variants: &[Enumerant], w: &mut W) -> std::io::Result<()> {
+fn vk2rv(name: &str, variants: &[Enumerant], w: &mut Vec<u8>) {
     if variants.is_empty() {
-        return Ok(());
+        return;
     }
 
     let mut prefix = Vec::with_capacity(128);
     prefix.extend_from_slice(b"VK");
-    cc2ssc(&mut prefix, name.bytes().skip(2));
+    pc2ssc(&mut prefix, name.bytes().skip(2));
 
     // Append / so we pick up the end of the name and stop matching
     prefix.push(b'/');
@@ -494,19 +473,17 @@ fn vk2rv<W: std::io::Write>(name: &str, variants: &[Enumerant], w: &mut W) -> st
             let alias = strip_prefix(alias, &prefix).unwrap_or(alias);
             ssc2cc(&mut buffer, alias.bytes());
         } else {
-            use std::io::Write;
             // NOTE: Need to write formatted output since we do a conversion for bit-position based
             // enums.
-            write!(&mut buffer, "{}", v.value)?;
+            let value = format!("{}", v.value);
+            buffer.extend_from_slice(value.as_bytes());
         }
 
         buffer.extend_from_slice(b",\n");
-        w.write_all(&buffer)?;
+        w.extend_from_slice(&buffer);
 
         buffer.clear();
     }
-
-    Ok(())
 }
 
 fn strip_prefix<'i>(name: &'i str, prefix: &'i [u8]) -> Option<&'i str> {
@@ -528,11 +505,6 @@ fn strip_prefix<'i>(name: &'i str, prefix: &'i [u8]) -> Option<&'i str> {
     }
 }
 
-struct Enum<'e> {
-    name: &'e str,
-    enumerants: Vec<Enumerant<'e>>,
-}
-
 #[derive(Clone, Debug)]
 struct Enumerant<'e> {
     name: &'e str,
@@ -551,13 +523,19 @@ impl std::fmt::Display for EnumerantValue<'_> {
         match self {
             Self::Alias(a) => write!(f, "{}", a),
             Self::BitPos(b) => write!(f, "0x{:X}", 0x1 << b),
-            Self::Integer(i) => write!(f, "{}", i),
+            Self::Integer(i) => {
+                if i.bytes().any(|b| b == b'~') {
+                    write!(f, "{}", i.replace('~', "!"))
+                } else {
+                    write!(f, "{}", i)
+                }
+            },
         }
     }
 }
 
-/// Convert an iterator over chars, B, from CAPS to CamelCase, storing it in `buffer`.
-fn c2cc<B>(buffer: &mut Vec<u8>, mut name: B)
+/// Convert an iterator over chars, B, from CAPS to PascalCase, storing it in `buffer`.
+fn c2pc<B>(buffer: &mut Vec<u8>, mut name: B)
 where
     B: Iterator<Item = u8>,
 {
@@ -567,9 +545,9 @@ where
     }
 }
 
-/// Convert an iterator over bytes, `B`, from CamelCase to SCREAMING_SNAKE_CASE storing it in
+/// Convert an iterator over bytes, `B`, from PamelCase to SCREAMING_SNAKE_CASE storing it in
 /// `buffer`.
-fn cc2ssc<B>(buffer: &mut Vec<u8>, name: B)
+fn pc2ssc<B>(buffer: &mut Vec<u8>, name: B)
 where
     B: Iterator<Item = u8>,
 {
@@ -583,6 +561,7 @@ where
     }
 }
 
+/// Convert a string from camelCase to snake_case.
 fn cc2sc(buffer: &mut Vec<u8>, name: &str) {
     let mut was_upper = false;
     for (i, c) in name.bytes().enumerate() {
