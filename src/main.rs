@@ -6,6 +6,7 @@ const BASIC_RUST_TYPE: [&str; 12] = [
     "c_void", "c_char", "f32", "f64", "u8", "u16", "u32", "u64", "i32", "i64", "usize", "i32",
 ];
 
+// TODO: Should just write to a `vk.rs` and `vk_loader.rs` directly and ask for overwrite if needed
 fn main() -> std::io::Result<()> {
     let path = std::env::args()
         .nth(1)
@@ -28,30 +29,27 @@ fn process(registry: roxmltree::Document) -> std::io::Result<()> {
     let root = registry.root_element();
     let mut enums = generate_enums(&root);
 
-    for child in root.children() {
-        if child.is_element() {
-            let name = child.tag_name().name();
-
-            if name == "enums" {
-                if let Some(name) = child.attribute("name") {
-                    if let Some(e) = enums.iter_mut().find(|e| e.name == name) {
-                        generate_variants(e, &child);
-                    } else {
-                        let mut e = Enum {
-                            name,
-                            enumerants: Vec::new(),
-                        };
-                        generate_variants(&mut e, &child);
-                        enums.push(e);
-                    }
+    for child in root.children().filter(|c| c.is_element()) {
+        let name = child.tag_name().name();
+        if name == "enums" {
+            if let Some(name) = child.attribute("name") {
+                if let Some(e) = enums.iter_mut().find(|e| e.name == name) {
+                    generate_variants(e, &child);
                 } else {
-                    eprintln!("Unnamed enum found!");
+                    let mut e = Enum {
+                        name,
+                        enumerants: Vec::new(),
+                    };
+                    generate_variants(&mut e, &child);
+                    enums.push(e);
                 }
-            } else if name == "extensions" {
-                for item in child.children() {
-                    if item.is_element() && (item.tag_name().name() == "extension") {
-                        // generate_extension(&item);
-                    }
+            } else {
+                eprintln!("Unnamed enum found!");
+            }
+        } else if name == "extensions" {
+            for item in child.children() {
+                if item.is_element() && (item.tag_name().name() == "extension") {
+                    // generate_extension(&item);
                 }
             }
         }
@@ -119,13 +117,9 @@ fn generate_enums<'r, 's>(root: &'r roxmltree::Node<'s, 's>) -> Vec<Enum<'s>> {
         .children()
         .filter(|child| child.is_element() && (child.tag_name().name() == "types"))
         .flat_map(|t| t.descendants().filter(|t| t.is_element()))
-        .filter_map(|e| {
-            Some(e)
-                .zip(e.attribute("category").zip(e.attribute("name")))
-                .map(|(e, (c, n))| (e, c, n))
-        });
+        .filter_map(|e| Some(e).zip(e.attribute("category").zip(e.attribute("name"))));
 
-    for (node, category, name) in elements {
+    for (node, (category, name)) in elements {
         if let Some(alias) = node.attribute("alias") {
             structure.extend_from_slice(b"pub type ");
             vk2rt(name, &mut structure);
@@ -158,8 +152,6 @@ fn generate_enums<'r, 's>(root: &'r roxmltree::Node<'s, 's>) -> Vec<Enum<'s>> {
     enums
 }
 
-// TODO: Some structures are aliases so we must create a type definition for them instead of
-// generating a full structure.
 fn generate_struct(buffer: &mut Vec<u8>, name: &str, structure: &roxmltree::Node) -> bool {
     // Do not emit these placeholder structures
     if (name == "VkBaseInStructure") || (name == "VkBaseOutStructure") {
@@ -328,7 +320,7 @@ impl<'t> CToken<'t> {
     }
 }
 
-impl<'t> From<char> for CToken<'t> {
+impl From<char> for CToken<'_> {
     fn from(c: char) -> Self {
         match c {
             '[' => CToken::BracketLeft,
@@ -371,7 +363,7 @@ enum CQualifier {
     Volatile,
 }
 
-fn generate_variants<'b, 'n>(e: &'b mut Enum<'n>, node: &'b roxmltree::Node<'n, 'n>) {
+fn generate_variants<'n>(e: &mut Enum<'n>, node: &roxmltree::Node<'n, 'n>) {
     let children = node
         .children()
         .filter(|c| c.is_element() && (c.tag_name().name() == "enum"));
