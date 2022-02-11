@@ -1,3 +1,13 @@
+// Road Map:
+// [ ] - Write to a file named vk.rs directly. Ask for permission before overwriting an existing
+//       one.
+// [ ] - Emit Vulkan commands
+// [ ] - Emit Vulkan extensions
+//     [ ] - Emit constants
+//     [ ] - Emit enumerations
+//     [ ] - Emit structures
+// [ ] - Generate function pointer loading library
+
 const BASIC_C_TYPE: [&str; 12] = [
     "void", "char", "float", "double", "uint8_t", "uint16_t", "uint32_t", "uint64_t", "int32_t",
     "int64_t", "size_t", "int",
@@ -80,11 +90,16 @@ fn generate_types(root: &roxmltree::Node) -> std::io::Result<()> {
         .filter(|child| child.is_element() && (child.tag_name().name() == "enums"))
         .filter_map(|e| Some(e).zip(e.attribute("name")));
     for (node, name) in enums {
-        generate_enum(&node, name, &mut enumerants, &mut buffer);
+        if name == "API Constants" {
+            generate_constants(&node, &mut enumerants, &mut buffer);
+        } else {
+            generate_enum(&node, name, &mut enumerants, &mut buffer);
+            enumerants.clear();
+        }
+
         buffer.push(b'\n');
         stdout_locked.write_all(&buffer)?;
         buffer.clear();
-        enumerants.clear();
     }
 
     let elements = root
@@ -113,13 +128,75 @@ fn generate_types(root: &roxmltree::Node) -> std::io::Result<()> {
     Ok(())
 }
 
+fn generate_constants<'c>(
+    node: &roxmltree::Node<'c, 'c>,
+    enums: &mut Vec<Enumerant<'c>>,
+    buf: &mut Vec<u8>,
+) {
+    // Set up a buffer to hold previous constants in order to account for proper types in aliases
+    let mut constants: Vec<(&str, &str)> = Vec::with_capacity(64);
+
+    generate_variants(node, enums);
+    enums.drain(..).for_each(|e| {
+        buf.extend_from_slice(b"pub const ");
+        let name = e.name.get(3..).unwrap_or(e.name);
+        buf.extend_from_slice(name.as_bytes());
+        match e.value {
+            EnumerantValue::Alias(alias) => {
+                buf.extend_from_slice(b": ");
+                let t = constants
+                    .iter()
+                    .find(|c| c.1 == alias)
+                    .map(|c| c.0)
+                    .unwrap_or("u32");
+                buf.extend_from_slice(t.as_bytes());
+                buf.extend_from_slice(b" = ");
+                let value = if alias.starts_with("VK_") {
+                    alias.get(3..).unwrap_or(alias)
+                } else {
+                    alias
+                };
+                buf.extend_from_slice(value.as_bytes());
+            }
+            EnumerantValue::BitPos(bpos) => {
+                buf.extend_from_slice(b": u32 = ");
+                let value = format!("{}", bpos);
+                buf.extend_from_slice(value.as_bytes());
+                constants.push(("u32", name));
+            }
+            EnumerantValue::Integer(i) => {
+                // TODO: Unify these sanitizations as well as the implicit one in the Display
+                // trait for EnumerantValue into one function.
+                // TODO: Control allocations
+                let i = format!("{}", i);
+                let (t, value) = if i.contains("ULL") {
+                    ("u64", i.replace("ULL", ""))
+                } else if i.contains('f') {
+                    ("f32", i.replace("f", ""))
+                } else if i.contains('U') {
+                    ("u32", i.replace("U", ""))
+                } else {
+                    ("u32", i)
+                };
+
+                buf.extend_from_slice(b": ");
+                buf.extend_from_slice(t.as_bytes());
+                buf.extend_from_slice(b" = ");
+                buf.extend_from_slice(value.as_bytes());
+                constants.push((t, name));
+            }
+        }
+        buf.extend_from_slice(b";\n");
+    });
+}
+
 fn generate_enum<'e>(
     node: &roxmltree::Node<'e, 'e>,
     name: &'e str,
     enumerants: &mut Vec<Enumerant<'e>>,
     buffer: &mut Vec<u8>,
 ) {
-    generate_variants(&node, enumerants);
+    generate_variants(node, enumerants);
 
     buffer.extend_from_slice(b"#[derive(Clone, Copy, Debug)]\n");
     buffer.extend_from_slice(b"#[repr(C)]\n");
@@ -184,6 +261,39 @@ fn generate_struct(buffer: &mut Vec<u8>, name: &str, structure: &roxmltree::Node
 
     buffer.extend_from_slice(b"\n}\n");
     true
+}
+
+fn generate_variants<'e>(node: &roxmltree::Node<'e, 'e>, enumerants: &mut Vec<Enumerant<'e>>) {
+    let children = node
+        .children()
+        .filter(|c| c.is_element() && (c.tag_name().name() == "enum"));
+    for child in children {
+        let name = child.attribute("name").unwrap_or("UnknownEnumerant");
+
+        if let Some(value) = child.attribute("value") {
+            let enumerant = Enumerant {
+                name,
+                value: EnumerantValue::Integer(value),
+            };
+            enumerants.push(enumerant);
+        } else if let Some(bitpos) = child.attribute("bitpos") {
+            if let Ok(bitpos) = bitpos.parse::<u32>() {
+                let enumerant = Enumerant {
+                    name,
+                    value: EnumerantValue::BitPos(bitpos),
+                };
+                enumerants.push(enumerant);
+            }
+        } else if let Some(alias) = child.attribute("alias") {
+            let enumerant = Enumerant {
+                name,
+                value: EnumerantValue::Alias(alias),
+            };
+            enumerants.push(enumerant);
+        } else if let Some(_offset) = child.attribute("offset") {
+            eprintln!("Enumerant {} has offset!", name);
+        }
+    }
 }
 
 /// Convert a list of C tokens to a Rust type.
@@ -342,41 +452,6 @@ enum CQualifier {
     Volatile,
 }
 
-fn generate_variants<'e>(node: &roxmltree::Node<'e, 'e>, enumerants: &mut Vec<Enumerant<'e>>) {
-    let children = node
-        .children()
-        .filter(|c| c.is_element() && (c.tag_name().name() == "enum"));
-    for child in children {
-        let name = child.attribute("name").unwrap_or("UnknownEnumerant");
-
-        if let Some(value) = child.attribute("value") {
-            let enumerant = Enumerant {
-                name,
-                value: EnumerantValue::Integer(value),
-            };
-            enumerants.push(enumerant);
-        } else if let Some(bitpos) = child.attribute("bitpos") {
-            if let Ok(bitpos) = bitpos.parse::<u32>() {
-                let enumerant = Enumerant {
-                    name,
-                    value: EnumerantValue::BitPos(bitpos),
-                };
-                enumerants.push(enumerant);
-            }
-        } else if let Some(alias) = child.attribute("alias") {
-            let enumerant = Enumerant {
-                name,
-                value: EnumerantValue::Alias(alias),
-            };
-            enumerants.push(enumerant);
-        } else if let Some(_offset) = child.attribute("offset") {
-            eprintln!("Enumerant with offset found!");
-        } else {
-            eprintln!("Enumerant {} has no value!", name);
-        }
-    }
-}
-
 /// Convert a Vulkan structure member name to a Rust structure member name
 fn vk2rm(buffer: &mut Vec<u8>, mut name: &str) {
     if name == "sType" {
@@ -418,7 +493,7 @@ fn vk2rt(vk_name: &str, buffer: &mut Vec<u8>) {
         }
     } else if vk_name.starts_with("Vk") {
         // Find consecutive capitals at the end of the type name, e.g. `EXT`, `KHR`, `NV`, etc.
-        // and convert them to CamelCase
+        // and convert them to PascalCase
         let mut ncaps = 0;
         for b in vk_name.bytes().rev() {
             if b.is_ascii_uppercase() {
@@ -529,7 +604,7 @@ impl std::fmt::Display for EnumerantValue<'_> {
                 } else {
                     write!(f, "{}", i)
                 }
-            },
+            }
         }
     }
 }
