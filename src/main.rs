@@ -1,5 +1,5 @@
 // Road Map:
-// [ ] - Write to a file named vk.rs directly. Ask for permission before overwriting an existing
+// [X] - Write to a file named vk.rs directly. Ask for permission before overwriting an existing
 //       one.
 // [ ] - Emit Vulkan commands
 // [ ] - Emit Vulkan extensions
@@ -16,28 +16,68 @@ const BASIC_RUST_TYPE: [&str; 12] = [
     "c_void", "c_char", "f32", "f64", "u8", "u16", "u32", "u64", "i32", "i64", "usize", "i32",
 ];
 
-// TODO: Should just write to a `vk.rs` and `vk_loader.rs` directly and ask for overwrite if needed
+const OUTPUT_FILE_NAME: &str = "vk.rs";
+
 fn main() -> std::io::Result<()> {
-    let path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| String::from("vk.xml"));
-    match std::fs::read_to_string(&path) {
-        Ok(source) => match roxmltree::Document::parse(&source) {
-            Ok(registry) => process(registry)?,
-            Err(e) => eprintln!("Failed to parse Vulkan XML registry!\n{}", e),
-        },
-        Err(e) => eprintln!(
-            "Could not read Vulkan XML registry at path `{}`!\n{}",
-            path, e
-        ),
+    let file = {
+        let mut f = std::fs::OpenOptions::new();
+        f.write(true).create_new(true);
+
+        f
     };
+
+    let output = match file.open(OUTPUT_FILE_NAME) {
+        Ok(f) => Some(f),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            eprint!(
+                "{} alread exists. Would you like to overwrite? (Y/N): ",
+                OUTPUT_FILE_NAME
+            );
+            // Get input
+            let mut buffer = String::new();
+            std::io::stdin().read_line(&mut buffer)?;
+            let input = buffer.trim_end().to_lowercase();
+
+            if input == "y" {
+                Some(std::fs::File::create(OUTPUT_FILE_NAME)?)
+            } else if input == "n" {
+                None
+            } else {
+                eprintln!("Unknown input. Exiting...");
+                None
+            }
+        }
+        Err(e) => return Err(e),
+    };
+
+    if let Some(output) = output {
+        let path = std::env::args()
+            .nth(1)
+            .unwrap_or_else(|| String::from("vk.xml"));
+        match std::fs::read_to_string(&path) {
+            Ok(source) => match roxmltree::Document::parse(&source) {
+                Ok(registry) => {
+                    let mut writer = std::io::BufWriter::new(output);
+                    process(registry, &mut writer)?
+                }
+                Err(e) => eprintln!("Failed to parse Vulkan XML registry!\n{}", e),
+            },
+            Err(e) => eprintln!(
+                "Could not read Vulkan XML registry at path `{}`!\n{}",
+                path, e
+            ),
+        };
+    }
 
     Ok(())
 }
 
-fn process(registry: roxmltree::Document) -> std::io::Result<()> {
+fn process<W>(registry: roxmltree::Document, output: &mut W) -> std::io::Result<()>
+where
+    W: std::io::Write,
+{
     let root = registry.root_element();
-    generate_types(&root)?;
+    generate_types(&root, output)?;
 
     for child in root.children().filter(|c| c.is_element()) {
         let name = child.tag_name().name();
@@ -77,11 +117,10 @@ fn _generate_extension(ext: &roxmltree::Node) {
     }
 }
 
-fn generate_types(root: &roxmltree::Node) -> std::io::Result<()> {
-    use std::io::Write;
-
-    let stdout = std::io::stdout();
-    let mut stdout_locked = stdout.lock();
+fn generate_types<W>(root: &roxmltree::Node, writer: &mut W) -> std::io::Result<()>
+where
+    W: std::io::Write
+{
     let mut buffer = Vec::with_capacity(4096);
 
     let mut enumerants = Vec::with_capacity(128);
@@ -98,7 +137,7 @@ fn generate_types(root: &roxmltree::Node) -> std::io::Result<()> {
         }
 
         buffer.push(b'\n');
-        stdout_locked.write_all(&buffer)?;
+        writer.write_all(&buffer)?;
         buffer.clear();
     }
 
@@ -116,11 +155,11 @@ fn generate_types(root: &roxmltree::Node) -> std::io::Result<()> {
             vk2rt(alias, &mut buffer);
             buffer.extend_from_slice(b";\n\n");
 
-            stdout_locked.write_all(&buffer)?;
+            writer.write_all(&buffer)?;
             buffer.clear();
         } else if (category == "struct") && generate_struct(&mut buffer, name, &node) {
             buffer.push(b'\n');
-            stdout_locked.write_all(&buffer)?;
+            writer.write_all(&buffer)?;
             buffer.clear();
         }
     }
@@ -165,15 +204,17 @@ fn generate_constants<'c>(
                 constants.push(("u32", name));
             }
             EnumerantValue::Integer(i) => {
-                // TODO: Unify these sanitizations as well as the implicit one in the Display
-                // trait for EnumerantValue into one function.
-                // TODO: Control allocations
-                let i = format!("{}", i);
+                let i = if i.bytes().any(|b| b == b'~') {
+                    i.replace('~', "!")
+                } else {
+                    i.to_string()
+                };
+
                 let (t, value) = if i.contains("ULL") {
                     ("u64", i.replace("ULL", ""))
                 } else if i.contains('f') {
                     ("f32", i.replace("f", ""))
-                } else if i.contains('U') {
+                } else if i.bytes().any(|b| b == b'U') {
                     ("u32", i.replace("U", ""))
                 } else {
                     ("u32", i)
@@ -548,9 +589,7 @@ fn vk2rv(name: &str, variants: &[Enumerant], w: &mut Vec<u8>) {
             let alias = strip_prefix(alias, &prefix).unwrap_or(alias);
             ssc2cc(&mut buffer, alias.bytes());
         } else {
-            // NOTE: Need to write formatted output since we do a conversion for bit-position based
-            // enums.
-            let value = format!("{}", v.value);
+            let value = v.value.sanitize();
             buffer.extend_from_slice(value.as_bytes());
         }
 
@@ -593,18 +632,26 @@ enum EnumerantValue<'v> {
     Integer(&'v str),
 }
 
-impl std::fmt::Display for EnumerantValue<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<'v> EnumerantValue<'v> {
+    pub fn sanitize(&self) -> std::borrow::Cow<'v, str> {
+        use std::borrow::Cow;
+
         match self {
-            Self::Alias(a) => write!(f, "{}", a),
-            Self::BitPos(b) => write!(f, "0x{:X}", 0x1 << b),
+            Self::Alias(a) => Cow::Borrowed(a),
+            Self::BitPos(b) => Cow::Owned(format!("0x{:X}", 0x1 << b)),
             Self::Integer(i) => {
-                if i.bytes().any(|b| b == b'~') {
-                    write!(f, "{}", i.replace('~', "!"))
+                if i.contains("ULL") {
+                    Cow::Owned(i.replace("ULL", ""))
+                } else if i.bytes().any(|b| b == b'f') {
+                    Cow::Owned(i.replace("f", ""))
+                } else if i.bytes().any(|b| b == b'U') {
+                    Cow::Owned(i.replace("U", ""))
+                } else if i.bytes().any(|b| b == b'~') {
+                    Cow::Owned(i.replace('~', "!"))
                 } else {
-                    write!(f, "{}", i)
+                    Cow::Borrowed(i)
                 }
-            }
+            },
         }
     }
 }
