@@ -72,54 +72,128 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
+// TODO: Clean up all node filtering instances into a single function
 fn process<W>(registry: roxmltree::Document, output: &mut W) -> std::io::Result<()>
 where
     W: std::io::Write,
 {
     let root = registry.root_element();
     generate_types(&root, output)?;
-
-    for child in root.children().filter(|c| c.is_element()) {
-        let name = child.tag_name().name();
-        if name == "extensions" {
-            for item in child.children() {
-                if item.is_element() && (item.tag_name().name() == "extension") {
-                    // generate_extension(&item);
-                }
-            }
-        }
-    }
+    generate_commands(root);
 
     Ok(())
 }
 
-fn _generate_extension(ext: &roxmltree::Node) {
-    if let Some(name) = ext.attribute("name") {
-        eprint!("{} ", name);
-    } else {
-        eprint!("Unknown extension ");
-    }
+fn generate_commands(root: roxmltree::Node) {
+    let mut buffer = Vec::with_capacity(1024);
 
-    for e in ext.children() {
-        if e.is_element() {
-            let name = e.tag_name().name();
-            if name == "require" {
-                eprint!("requires ");
-            } else if name == "remove" {
-                eprint!("removes ");
-            }
+    let commands = root
+        .children()
+        .filter(|child| child.is_element() && (child.tag_name().name() == "commands"))
+        .flat_map(|commands| {
+            commands
+                .children()
+                .filter(|node| node.is_element() && (node.tag_name().name() == "command"))
+        });
 
-            for item in e.children() {
-                eprint!("{} ", item.tag_name().name());
+    // There are two forms of the command tag:
+    // 1. Defines a command alias with the only attributes being `name` and `alias`.
+    // 2. Full definition of a command.
+    for command in commands {
+        let alias = command.attribute("name").zip(command.attribute("alias"));
+        if let Some((name, alias)) = alias {
+            eprintln!("pub type {} = {};", name, alias);
+        } else {
+            let prototype = command
+                .children()
+                .find(|child| child.is_element() && (child.tag_name().name() == "proto"))
+                .and_then(Prototype::extract);
+
+            let definition = command.children().filter_map(|node| {
+                if node.is_element() && (node.tag_name().name() == "param") {
+                    Parameter::extract(node)
+                } else {
+                    None
+                }
+            });
+            buffer.extend(definition);
+
+            if let Some(p) = prototype {
+                eprint!("pub type {} = unsafe extern \"system\" fn(", p.name);
+                buffer.drain(..).enumerate().for_each(|(i, parameter)| {
+                    if i != 0 {
+                        eprint!(", ");
+                    }
+                    eprint!("{}: {}", parameter.name, parameter.type_name);
+                });
+                eprintln!(") -> {}", p.return_value);
             }
-            eprintln!();
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Prototype<'p> {
+    pub name: &'p str,
+    pub return_value: &'p str,
+}
+
+impl<'p> Prototype<'p> {
+    /// Extract a Vulkan function prototype.
+    ///
+    /// The function prototype includes the name and return value of the function that is being
+    /// declared.
+    pub fn extract(node: roxmltree::Node<'p, 'p>) -> Option<Self> {
+        let name = node
+            .children()
+            .find(|child| child.is_element() && (child.tag_name().name() == "name"))
+            .as_ref()
+            .and_then(roxmltree::Node::text);
+
+        let return_value = node
+            .children()
+            .find(|child| child.is_element() && (child.tag_name().name() == "type"))
+            .as_ref()
+            .and_then(roxmltree::Node::text);
+
+        name.zip(return_value)
+            .map(|(name, return_value)| Self { name, return_value })
+    }
+}
+
+pub struct Parameter<'p> {
+    pub name: &'p str,
+    pub type_name: &'p str,
+}
+
+impl<'p> Parameter<'p> {
+    /// Extract a Vulkan command parameter.
+    ///
+    /// A parameter can have attributes which provide additional information about the parameter as
+    /// well as the definition itself.
+    pub fn extract(node: roxmltree::Node<'p, 'p>) -> Option<Self> {
+        // In terms of generation of function prototypes, the attributes do not have an impact on
+        // the parameter, thus we ignore them.
+        let name = node
+            .children()
+            .find(|child| child.is_element() && (child.tag_name().name() == "name"))
+            .as_ref()
+            .and_then(roxmltree::Node::text);
+
+        let type_name = node
+            .children()
+            .find(|child| child.is_element() && (child.tag_name().name() == "type"))
+            .as_ref()
+            .and_then(roxmltree::Node::text);
+
+        name.zip(type_name)
+            .map(|(name, type_name)| Self { name, type_name })
     }
 }
 
 fn generate_types<W>(root: &roxmltree::Node, writer: &mut W) -> std::io::Result<()>
 where
-    W: std::io::Write
+    W: std::io::Write,
 {
     let mut buffer = Vec::with_capacity(4096);
 
@@ -651,7 +725,7 @@ impl<'v> EnumerantValue<'v> {
                 } else {
                     Cow::Borrowed(i)
                 }
-            },
+            }
         }
     }
 }
