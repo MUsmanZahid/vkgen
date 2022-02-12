@@ -1,7 +1,7 @@
 // Road Map:
 // [X] - Write to a file named vk.rs directly. Ask for permission before overwriting an existing
 //       one.
-// [ ] - Emit Vulkan commands
+// [X] - Emit Vulkan commands
 // [ ] - Emit Vulkan extensions
 //     [ ] - Emit constants
 //     [ ] - Emit enumerations
@@ -73,28 +73,25 @@ fn main() -> std::io::Result<()> {
 }
 
 // TODO: Clean up all node filtering instances into a single function
-fn process<W>(registry: roxmltree::Document, output: &mut W) -> std::io::Result<()>
+pub fn process<W>(registry: roxmltree::Document, output: &mut W) -> std::io::Result<()>
 where
     W: std::io::Write,
 {
     let root = registry.root_element();
-    generate_types(&root, output)?;
-    generate_commands(root);
+    let mut buffer = Vec::with_capacity(4 * 4096);
+    generate_types(root, output, &mut buffer)?;
+    generate_commands(root, output, &mut buffer)?;
 
     Ok(())
 }
 
-fn generate_commands(root: roxmltree::Node) {
-    let mut buffer = Vec::with_capacity(1024);
-
-    let commands = root
-        .children()
-        .filter(|child| child.is_element() && (child.tag_name().name() == "commands"))
-        .flat_map(|commands| {
-            commands
-                .children()
-                .filter(|node| node.is_element() && (node.tag_name().name() == "command"))
-        });
+pub fn generate_commands<W: std::io::Write>(
+    root: roxmltree::Node,
+    output: &mut W,
+    buffer: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    let mut params = Vec::with_capacity(1024);
+    let commands = filter(root, "commands").flat_map(|commands| filter(commands, "command"));
 
     // There are two forms of the command tag:
     // 1. Defines a command alias with the only attributes being `name` and `alias`.
@@ -102,138 +99,118 @@ fn generate_commands(root: roxmltree::Node) {
     for command in commands {
         let alias = command.attribute("name").zip(command.attribute("alias"));
         if let Some((name, alias)) = alias {
-            eprintln!("pub type {} = {};", name, alias);
+            buffer.extend_from_slice(b"pub type ");
+            vk2rt(name, buffer);
+            buffer.extend_from_slice(b" = ");
+            vk2rt(alias, buffer);
+            buffer.extend_from_slice(b";\n");
+
+            output.write_all(&buffer)?;
+            buffer.clear();
         } else {
             let prototype = command
                 .children()
                 .find(|child| child.is_element() && (child.tag_name().name() == "proto"))
-                .and_then(Prototype::extract);
-
-            let definition = command.children().filter_map(|node| {
-                if node.is_element() && (node.tag_name().name() == "param") {
-                    Parameter::extract(node)
-                } else {
-                    None
-                }
-            });
-            buffer.extend(definition);
+                .and_then(FunctionSection::extract);
 
             if let Some(p) = prototype {
-                eprint!("pub type {} = unsafe extern \"system\" fn(", p.name);
-                buffer.drain(..).enumerate().for_each(|(i, parameter)| {
-                    if i != 0 {
-                        eprint!(", ");
+                let definition = command.children().filter_map(|node| {
+                    if node.is_element() && (node.tag_name().name() == "param") {
+                        FunctionSection::extract(node)
+                    } else {
+                        None
                     }
-                    eprint!("{}: {}", parameter.name, parameter.type_name);
                 });
-                eprintln!(") -> {}", p.return_value);
+                params.extend(definition);
+
+                buffer.extend_from_slice(b"pub type ");
+                vk2rt(p.name, buffer);
+                buffer.extend_from_slice(b" = unsafe extern \"system\" fn(");
+
+                params.drain(..).enumerate().for_each(|(i, parameter)| {
+                    if i != 0 {
+                        buffer.extend_from_slice(b", ");
+                    }
+                    vk2rm(buffer, parameter.name);
+                    buffer.extend_from_slice(b": ");
+                    vk2rt(parameter.type_name, buffer);
+                });
+
+                buffer.push(b')');
+                if p.type_name != "void" {
+                    buffer.extend_from_slice(b" -> ");
+                    vk2rt(p.type_name, buffer);
+                }
+                buffer.extend_from_slice(b";\n");
+
+                output.write_all(&buffer)?;
+                buffer.clear();
             }
         }
     }
+
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct Prototype<'p> {
-    pub name: &'p str,
-    pub return_value: &'p str,
+pub struct FunctionSection<'s> {
+    pub name: &'s str,
+    pub type_name: &'s str,
 }
 
-impl<'p> Prototype<'p> {
-    /// Extract a Vulkan function prototype.
+impl<'s> FunctionSection<'s> {
+    /// Extract a Vulkan function section.
     ///
-    /// The function prototype includes the name and return value of the function that is being
-    /// declared.
-    pub fn extract(node: roxmltree::Node<'p, 'p>) -> Option<Self> {
-        let name = node
-            .children()
-            .find(|child| child.is_element() && (child.tag_name().name() == "name"))
-            .as_ref()
-            .and_then(roxmltree::Node::text);
-
-        let return_value = node
-            .children()
-            .find(|child| child.is_element() && (child.tag_name().name() == "type"))
-            .as_ref()
-            .and_then(roxmltree::Node::text);
-
-        name.zip(return_value)
-            .map(|(name, return_value)| Self { name, return_value })
-    }
-}
-
-pub struct Parameter<'p> {
-    pub name: &'p str,
-    pub type_name: &'p str,
-}
-
-impl<'p> Parameter<'p> {
-    /// Extract a Vulkan command parameter.
-    ///
-    /// A parameter can have attributes which provide additional information about the parameter as
-    /// well as the definition itself.
-    pub fn extract(node: roxmltree::Node<'p, 'p>) -> Option<Self> {
-        // In terms of generation of function prototypes, the attributes do not have an impact on
-        // the parameter, thus we ignore them.
-        let name = node
-            .children()
-            .find(|child| child.is_element() && (child.tag_name().name() == "name"))
-            .as_ref()
-            .and_then(roxmltree::Node::text);
-
-        let type_name = node
-            .children()
-            .find(|child| child.is_element() && (child.tag_name().name() == "type"))
-            .as_ref()
-            .and_then(roxmltree::Node::text);
+    /// A function section can be a pair of either:
+    /// 1. The function name and its return value, or
+    /// 2. The name of one of the function's parameters and its corresponding type.
+    pub fn extract(node: roxmltree::Node<'s, 's>) -> Option<Self> {
+        let name = find(node, "name").as_ref().and_then(roxmltree::Node::text);
+        let type_name = find(node, "type").as_ref().and_then(roxmltree::Node::text);
 
         name.zip(type_name)
             .map(|(name, type_name)| Self { name, type_name })
     }
 }
 
-fn generate_types<W>(root: &roxmltree::Node, writer: &mut W) -> std::io::Result<()>
-where
-    W: std::io::Write,
-{
-    let mut buffer = Vec::with_capacity(4096);
-
+fn generate_types<W: std::io::Write>(
+    root: roxmltree::Node,
+    output: &mut W,
+    buffer: &mut Vec<u8>,
+) -> std::io::Result<()> {
     let mut enumerants = Vec::with_capacity(128);
-    let enums = root
-        .children()
-        .filter(|child| child.is_element() && (child.tag_name().name() == "enums"))
-        .filter_map(|e| Some(e).zip(e.attribute("name")));
+    let enums = filter(root, "enums").filter_map(|e| Some(e).zip(e.attribute("name")));
     for (node, name) in enums {
-        if name == "API Constants" {
-            generate_constants(&node, &mut enumerants, &mut buffer);
+        let emitted = if name == "API Constants" {
+            generate_constants(node, &mut enumerants, buffer)
         } else {
-            generate_enum(&node, name, &mut enumerants, &mut buffer);
-            enumerants.clear();
-        }
+            generate_enum(node, name, &mut enumerants, buffer)
+        };
 
-        buffer.push(b'\n');
-        writer.write_all(&buffer)?;
-        buffer.clear();
+        if emitted {
+            buffer.push(b'\n');
+            output.write_all(&buffer)?;
+            buffer.clear();
+        }
     }
 
-    let elements = root
-        .children()
-        .filter(|child| child.is_element() && (child.tag_name().name() == "types"))
+    let elements = filter(root, "types")
         .flat_map(|t| t.children().filter(|t| t.is_element()))
         .filter_map(|e| Some(e).zip(e.attribute("category").zip(e.attribute("name"))));
 
     for (node, (category, name)) in elements {
         if let Some(alias) = node.attribute("alias") {
             buffer.extend_from_slice(b"pub type ");
-            vk2rt(name, &mut buffer);
+            vk2rt(name, buffer);
             buffer.extend_from_slice(b" = ");
-            vk2rt(alias, &mut buffer);
+            vk2rt(alias, buffer);
             buffer.extend_from_slice(b";\n\n");
 
-            writer.write_all(&buffer)?;
+            output.write_all(&buffer)?;
             buffer.clear();
-        } else if (category == "struct") && generate_struct(&mut buffer, name, &node) {
+        } else if (category == "struct") && generate_struct(buffer, name, node) {
             buffer.push(b'\n');
-            writer.write_all(&buffer)?;
+            output.write_all(&buffer)?;
             buffer.clear();
         }
     }
@@ -242,10 +219,10 @@ where
 }
 
 fn generate_constants<'c>(
-    node: &roxmltree::Node<'c, 'c>,
+    node: roxmltree::Node<'c, 'c>,
     enums: &mut Vec<Enumerant<'c>>,
     buf: &mut Vec<u8>,
-) {
+) -> bool {
     // Set up a buffer to hold previous constants in order to account for proper types in aliases
     let mut constants: Vec<(&str, &str)> = Vec::with_capacity(64);
 
@@ -303,26 +280,35 @@ fn generate_constants<'c>(
         }
         buf.extend_from_slice(b";\n");
     });
+
+    true
 }
 
 fn generate_enum<'e>(
-    node: &roxmltree::Node<'e, 'e>,
+    node: roxmltree::Node<'e, 'e>,
     name: &'e str,
     enumerants: &mut Vec<Enumerant<'e>>,
     buffer: &mut Vec<u8>,
-) {
+) -> bool {
     generate_variants(node, enumerants);
+    let has_values = !enumerants.is_empty();
 
-    buffer.extend_from_slice(b"#[derive(Clone, Copy, Debug)]\n");
-    buffer.extend_from_slice(b"#[repr(C)]\n");
-    buffer.extend_from_slice(b"pub enum ");
-    vk2rt(name, buffer);
-    buffer.extend_from_slice(b" {\n");
-    vk2rv(name, enumerants, buffer);
-    buffer.extend_from_slice(b"}\n");
+    if has_values {
+        buffer.extend_from_slice(b"#[derive(Clone, Copy, Debug)]\n");
+        buffer.extend_from_slice(b"#[repr(C)]\n");
+        buffer.extend_from_slice(b"pub enum ");
+        vk2rt(name, buffer);
+        buffer.extend_from_slice(b" {\n");
+        vk2rv(name, enumerants, buffer);
+        buffer.extend_from_slice(b"}\n");
+
+        enumerants.clear();
+    }
+
+    has_values
 }
 
-fn generate_struct(buffer: &mut Vec<u8>, name: &str, structure: &roxmltree::Node) -> bool {
+fn generate_struct(buffer: &mut Vec<u8>, name: &str, node: roxmltree::Node) -> bool {
     // Do not emit these placeholder structures
     if (name == "VkBaseInStructure") || (name == "VkBaseOutStructure") {
         return false;
@@ -336,27 +322,26 @@ fn generate_struct(buffer: &mut Vec<u8>, name: &str, structure: &roxmltree::Node
 
     let mut type_buffer = String::with_capacity(128);
 
-    let members = structure
-        .children()
-        .filter(|c| c.is_element() && (c.tag_name().name() == "member"));
-    for member in members {
+    for member in filter(node, "member") {
         buffer.extend_from_slice(b"\n   ");
 
-        let children = member.children().filter(|c| c.is_element() || c.is_text());
-        for child in children {
+        let children = member.children().filter_map(|c| {
+            if (c.is_element() || c.is_text()) && (c.tag_name().name() != "comment") {
+                c.text().map(|s| (c, s))
+            } else {
+                None
+            }
+        });
+        for (child, mut text) in children {
             let name = child.tag_name().name();
-            if name != "comment" {
-                if let Some(text) = child.text() {
-                    let text = text.trim();
-                    if !text.is_empty() {
-                        if name == "name" {
-                            buffer.extend_from_slice(b" pub ");
-                            vk2rm(buffer, text);
-                        } else {
-                            type_buffer.push(' ');
-                            type_buffer.push_str(text);
-                        }
-                    }
+            text = text.trim();
+            if !text.is_empty() {
+                if name == "name" {
+                    buffer.extend_from_slice(b" pub ");
+                    vk2rm(buffer, text);
+                } else {
+                    type_buffer.push(' ');
+                    type_buffer.push_str(text);
                 }
             }
         }
@@ -378,20 +363,17 @@ fn generate_struct(buffer: &mut Vec<u8>, name: &str, structure: &roxmltree::Node
     true
 }
 
-fn generate_variants<'e>(node: &roxmltree::Node<'e, 'e>, enumerants: &mut Vec<Enumerant<'e>>) {
-    let children = node
-        .children()
-        .filter(|c| c.is_element() && (c.tag_name().name() == "enum"));
-    for child in children {
-        let name = child.attribute("name").unwrap_or("UnknownEnumerant");
+fn generate_variants<'e>(node: roxmltree::Node<'e, 'e>, enumerants: &mut Vec<Enumerant<'e>>) {
+    for variant in filter(node, "enum") {
+        let name = variant.attribute("name").unwrap_or("UnknownEnumerant");
 
-        if let Some(value) = child.attribute("value") {
+        if let Some(value) = variant.attribute("value") {
             let enumerant = Enumerant {
                 name,
                 value: EnumerantValue::Integer(value),
             };
             enumerants.push(enumerant);
-        } else if let Some(bitpos) = child.attribute("bitpos") {
+        } else if let Some(bitpos) = variant.attribute("bitpos") {
             if let Ok(bitpos) = bitpos.parse::<u32>() {
                 let enumerant = Enumerant {
                     name,
@@ -399,30 +381,40 @@ fn generate_variants<'e>(node: &roxmltree::Node<'e, 'e>, enumerants: &mut Vec<En
                 };
                 enumerants.push(enumerant);
             }
-        } else if let Some(alias) = child.attribute("alias") {
+        } else if let Some(alias) = variant.attribute("alias") {
             let enumerant = Enumerant {
                 name,
                 value: EnumerantValue::Alias(alias),
             };
             enumerants.push(enumerant);
-        } else if let Some(_offset) = child.attribute("offset") {
+        } else if let Some(_offset) = variant.attribute("offset") {
             eprintln!("Enumerant {} has offset!", name);
         }
     }
 }
 
+pub fn filter<'b, 'n>(
+    node: roxmltree::Node<'b, 'n>,
+    name: &'b str,
+) -> impl Iterator<Item = roxmltree::Node<'b, 'n>> {
+    node.children()
+        .filter(move |child| child.is_element() && name == child.tag_name().name())
+}
+
+pub fn find<'n>(node: roxmltree::Node<'n, 'n>, name: &str) -> Option<roxmltree::Node<'n, 'n>> {
+    node.children()
+        .find(|child| child.is_element() && (child.tag_name().name() == name))
+}
+
 /// Convert a list of C tokens to a Rust type.
 fn ct2rt(buffer: &mut Vec<u8>, tokens: Vec<CToken>) {
-    let search = tokens
-        .iter()
-        .filter_map(|t| {
-            if let CToken::Identifier(s) = t {
-                Some(s)
-            } else {
-                None
-            }
-        })
-        .next();
+    let search = tokens.iter().find_map(|t| {
+        if let CToken::Identifier(s) = t {
+            Some(s)
+        } else {
+            None
+        }
+    });
 
     if let Some(identifier) = search {
         if tokens.len() == 1 {
@@ -601,16 +593,16 @@ fn vk2rm(buffer: &mut Vec<u8>, mut name: &str) {
 
 // TODO: Handle case for types beginning with `PFN_vk`
 /// Convert a Vulkan type to a Rust type
-fn vk2rt(vk_name: &str, buffer: &mut Vec<u8>) {
-    if let Some(i) = BASIC_C_TYPE.iter().position(|c| *c == vk_name) {
+fn vk2rt(name: &str, buffer: &mut Vec<u8>) {
+    if let Some(i) = BASIC_C_TYPE.iter().position(|c| *c == name) {
         if let Some(rtype) = BASIC_RUST_TYPE.get(i) {
             buffer.extend(rtype.bytes());
         }
-    } else if vk_name.starts_with("Vk") {
+    } else if name.starts_with("Vk") || name.starts_with("vk") {
         // Find consecutive capitals at the end of the type name, e.g. `EXT`, `KHR`, `NV`, etc.
         // and convert them to PascalCase
         let mut ncaps = 0;
-        for b in vk_name.bytes().rev() {
+        for b in name.bytes().rev() {
             if b.is_ascii_uppercase() {
                 ncaps += 1;
             } else {
@@ -618,15 +610,15 @@ fn vk2rt(vk_name: &str, buffer: &mut Vec<u8>) {
             }
         }
 
-        let len = vk_name.len();
+        let len = name.len();
         if (ncaps > 1) && (ncaps <= len - 2) {
-            buffer.extend(vk_name.bytes().skip(2).take(len - ncaps - 2));
-            c2pc(buffer, vk_name.bytes().skip(len - ncaps))
+            buffer.extend(name.bytes().skip(2).take(len - ncaps - 2));
+            c2pc(buffer, name.bytes().skip(len - ncaps))
         } else {
-            buffer.extend(vk_name.bytes().skip(2));
+            buffer.extend(name.bytes().skip(2));
         }
     } else {
-        buffer.extend_from_slice(vk_name.as_bytes());
+        buffer.extend_from_slice(name.as_bytes());
     }
 }
 
@@ -731,7 +723,7 @@ impl<'v> EnumerantValue<'v> {
 }
 
 /// Convert an iterator over chars, B, from CAPS to PascalCase, storing it in `buffer`.
-fn c2pc<B>(buffer: &mut Vec<u8>, mut name: B)
+pub fn c2pc<B>(buffer: &mut Vec<u8>, mut name: B)
 where
     B: Iterator<Item = u8>,
 {
@@ -743,7 +735,7 @@ where
 
 /// Convert an iterator over bytes, `B`, from PamelCase to SCREAMING_SNAKE_CASE storing it in
 /// `buffer`.
-fn pc2ssc<B>(buffer: &mut Vec<u8>, name: B)
+pub fn pc2ssc<B>(buffer: &mut Vec<u8>, name: B)
 where
     B: Iterator<Item = u8>,
 {
@@ -758,7 +750,7 @@ where
 }
 
 /// Convert a string from camelCase to snake_case.
-fn cc2sc(buffer: &mut Vec<u8>, name: &str) {
+pub fn cc2sc(buffer: &mut Vec<u8>, name: &str) {
     let mut was_upper = false;
     for (i, c) in name.bytes().enumerate() {
         if c.is_ascii_uppercase() {
@@ -775,7 +767,7 @@ fn cc2sc(buffer: &mut Vec<u8>, name: &str) {
 
 /// Convert an iterator over bytes, `B`, from SCREAMING_SNAKE_CASE to CamelCase storing it in
 /// `buffer`.
-fn ssc2cc<B>(buffer: &mut Vec<u8>, bytes: B)
+pub fn ssc2cc<B>(buffer: &mut Vec<u8>, bytes: B)
 where
     B: Iterator<Item = u8>,
 {
@@ -792,7 +784,7 @@ where
     }
 }
 
-fn _trim_suffix<'t>(s: &'t str, suffixes: &'t [&str]) -> &'t str {
+pub fn _trim_suffix<'t>(s: &'t str, suffixes: &'t [&str]) -> &'t str {
     if let Some(suffix) = suffixes.iter().find(|&&suffix| s.ends_with(suffix)) {
         if suffix.len() < s.len() {
             let y = s.len() - suffix.len();
