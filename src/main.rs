@@ -19,20 +19,19 @@ const BASIC_RUST_TYPE: [&str; 12] = [
 const OUTPUT_FILE_NAME: &str = "vk.rs";
 
 fn main() -> std::io::Result<()> {
-    let file = {
-        let mut f = std::fs::OpenOptions::new();
-        f.write(true).create_new(true);
-
-        f
-    };
-
-    let output = match file.open(OUTPUT_FILE_NAME) {
+    let output = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(OUTPUT_FILE_NAME)
+    {
         Ok(f) => Some(f),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            eprint!(
-                "{} alread exists. Would you like to overwrite? (Y/N): ",
+            print!(
+                "{} already exists. Would you like to overwrite? (Y/N): ",
                 OUTPUT_FILE_NAME
             );
+            <_ as std::io::Write>::flush(&mut std::io::stdout())?;
+
             // Get input
             let mut buffer = String::new();
             std::io::stdin().read_line(&mut buffer)?;
@@ -72,14 +71,15 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-// TODO: Clean up all node filtering instances into a single function
 pub fn process<W>(registry: roxmltree::Document, output: &mut W) -> std::io::Result<()>
 where
     W: std::io::Write,
 {
     let root = registry.root_element();
     let mut buffer = Vec::with_capacity(4 * 4096);
-    generate_types(root, output, &mut buffer)?;
+
+    generate_structs(root, output, &mut buffer)?;
+    generate_enums(root, output, &mut buffer)?;
     generate_commands(root, output, &mut buffer)?;
 
     Ok(())
@@ -173,51 +173,6 @@ impl<'s> FunctionSection<'s> {
     }
 }
 
-fn generate_types<W: std::io::Write>(
-    root: roxmltree::Node,
-    output: &mut W,
-    buffer: &mut Vec<u8>,
-) -> std::io::Result<()> {
-    let mut enumerants = Vec::with_capacity(128);
-    let enums = filter(root, "enums").filter_map(|e| Some(e).zip(e.attribute("name")));
-    for (node, name) in enums {
-        let emitted = if name == "API Constants" {
-            generate_constants(node, &mut enumerants, buffer)
-        } else {
-            generate_enum(node, name, &mut enumerants, buffer)
-        };
-
-        if emitted {
-            buffer.push(b'\n');
-            output.write_all(&buffer)?;
-            buffer.clear();
-        }
-    }
-
-    let elements = filter(root, "types")
-        .flat_map(|t| t.children().filter(|t| t.is_element()))
-        .filter_map(|e| Some(e).zip(e.attribute("category").zip(e.attribute("name"))));
-
-    for (node, (category, name)) in elements {
-        if let Some(alias) = node.attribute("alias") {
-            buffer.extend_from_slice(b"pub type ");
-            vk2rt(name, buffer);
-            buffer.extend_from_slice(b" = ");
-            vk2rt(alias, buffer);
-            buffer.extend_from_slice(b";\n\n");
-
-            output.write_all(&buffer)?;
-            buffer.clear();
-        } else if (category == "struct") && generate_struct(buffer, name, node) {
-            buffer.push(b'\n');
-            output.write_all(&buffer)?;
-            buffer.clear();
-        }
-    }
-
-    Ok(())
-}
-
 fn generate_constants<'c>(
     node: roxmltree::Node<'c, 'c>,
     enums: &mut Vec<Enumerant<'c>>,
@@ -282,6 +237,100 @@ fn generate_constants<'c>(
     });
 
     true
+}
+
+fn generate_enums<W: std::io::Write>(
+    root: roxmltree::Node,
+    output: &mut W,
+    buffer: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    let mut enumerants = Vec::with_capacity(128);
+    let enums = filter(root, "enums").filter_map(|e| e.attribute("name").map(|attr| (e, attr)));
+    for (node, name) in enums {
+        let emitted = if name == "API Constants" {
+            generate_constants(node, &mut enumerants, buffer)
+        } else {
+            generate_enum(node, name, &mut enumerants, buffer)
+        };
+
+        if emitted {
+            buffer.push(b'\n');
+            output.write_all(&buffer)?;
+            buffer.clear();
+        }
+    }
+
+    Ok(())
+}
+
+pub fn generate_extensions<W: std::io::Write>(
+    root: roxmltree::Node,
+    enums: &mut std::collections::HashMap<&str, Vec<Enumerant>>,
+    _output: &mut W,
+    _buffer: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    let extensions = filter(root, "extensions")
+        .flat_map(|ext| filter(ext, "extension"))
+        .filter_map(|ext| {
+            if !matches!(ext.attribute("supported"), Some("disabled")) {
+                ext.attribute("name").map(|n| (ext, n))
+            } else {
+                None
+            }
+        });
+
+    for (ext, name) in extensions {
+        eprintln!("{} -> {:?}:", name, ext.attribute("number"));
+
+        eprintln!("REQUIRES:");
+        let elements = filter(ext, "require").flat_map(|req| {
+            req.children().filter(|c| {
+                let name = c.tag_name().name();
+                c.is_element() && ((name == "type") || (name == "enum") || (name == "command"))
+            })
+        });
+        for element in elements {
+            eprintln!("\t{}", element.tag_name().name());
+            for attr in element.attributes() {
+                eprintln!("\t\t{}={}", attr.name(), attr.value());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn generate_structs<W: std::io::Write>(
+    root: roxmltree::Node,
+    output: &mut W,
+    buffer: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    let elements = filter(root, "types")
+        .flat_map(|t| t.children().filter(|t| t.is_element()))
+        .filter_map(|e| {
+            e.attribute("category")
+                .zip(e.attribute("name"))
+                .map(|(c, n)| (e, c, n))
+        });
+
+    for (node, category, name) in elements {
+        if let Some(alias) = node.attribute("alias") {
+            buffer.extend_from_slice(b"pub type ");
+            vk2rt(name, buffer);
+            buffer.extend_from_slice(b" = ");
+            vk2rt(alias, buffer);
+            buffer.extend_from_slice(b";\n\n");
+
+            output.write_all(&buffer)?;
+            buffer.clear();
+        } else if (category == "struct") && generate_struct(buffer, name, node) {
+            buffer.push(b'\n');
+            output.write_all(&buffer)?;
+            buffer.clear();
+        }
+    }
+
+    Ok(())
 }
 
 fn generate_enum<'e>(
@@ -594,11 +643,14 @@ fn vk2rm(buffer: &mut Vec<u8>, mut name: &str) {
 // TODO: Handle case for types beginning with `PFN_vk`
 /// Convert a Vulkan type to a Rust type
 fn vk2rt(name: &str, buffer: &mut Vec<u8>) {
+    let prefixes = ["Vk", "vk", "PFN_vk"];
     if let Some(i) = BASIC_C_TYPE.iter().position(|c| *c == name) {
         if let Some(rtype) = BASIC_RUST_TYPE.get(i) {
             buffer.extend(rtype.bytes());
         }
-    } else if name.starts_with("Vk") || name.starts_with("vk") {
+    } else if let Some(prefix) = prefixes.iter().find(|&&prefix| name.starts_with(prefix)) {
+        let plen = prefix.len();
+
         // Find consecutive capitals at the end of the type name, e.g. `EXT`, `KHR`, `NV`, etc.
         // and convert them to PascalCase
         let mut ncaps = 0;
@@ -611,11 +663,11 @@ fn vk2rt(name: &str, buffer: &mut Vec<u8>) {
         }
 
         let len = name.len();
-        if (ncaps > 1) && (ncaps <= len - 2) {
-            buffer.extend(name.bytes().skip(2).take(len - ncaps - 2));
+        if (ncaps > 1) && (ncaps <= len - plen) {
+            buffer.extend(name.bytes().skip(plen).take(len - ncaps - plen));
             c2pc(buffer, name.bytes().skip(len - ncaps))
         } else {
-            buffer.extend(name.bytes().skip(2));
+            buffer.extend(name.bytes().skip(plen));
         }
     } else {
         buffer.extend_from_slice(name.as_bytes());
@@ -686,13 +738,13 @@ fn strip_prefix<'i>(name: &'i str, prefix: &'i [u8]) -> Option<&'i str> {
 }
 
 #[derive(Clone, Debug)]
-struct Enumerant<'e> {
-    name: &'e str,
-    value: EnumerantValue<'e>,
+pub struct Enumerant<'e> {
+    pub name: &'e str,
+    pub value: EnumerantValue<'e>,
 }
 
 #[derive(Clone, Copy, Debug)]
-enum EnumerantValue<'v> {
+pub enum EnumerantValue<'v> {
     Alias(&'v str),
     BitPos(u32),
     Integer(&'v str),

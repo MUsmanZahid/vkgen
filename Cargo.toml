@@ -13,4 +13,5 @@ roxmltree = "0.14.1"
 opt-level = 1
 
 [profile.release]
-lto = true
+debug = true
+lto = "fat"
