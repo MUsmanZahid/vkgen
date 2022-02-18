@@ -2,6 +2,8 @@
 // [X] - Write to a file named vk.rs directly. Ask for permission before overwriting an existing
 //       one.
 // [X] - Emit Vulkan commands
+// [X] - Emit Vulkan handles
+// [ ] - Remove extra indirection - we first write to buffer, then we copy from buffer into output
 // [ ] - Emit Vulkan extensions
 //     [ ] - Emit constants
 //     [X] - Emit enumerations
@@ -71,38 +73,302 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-pub fn process<W>(registry: roxmltree::Document, output: &mut W) -> std::io::Result<()>
+pub fn process<W>(registry: roxmltree::Document, output: W) -> std::io::Result<()>
 where
     W: std::io::Write,
 {
-    let root = registry.root_element();
-    let mut buffer = Vec::with_capacity(4 * 4096);
-
-    generate_structs(root, output, &mut buffer)?;
-    generate_enums(root, output, &mut buffer)?;
-    generate_commands(root, output, &mut buffer)?;
-    generate_extensions(root, output, &mut buffer)?;
-
-    Ok(())
+    let generator = Generator {
+        buffer: Vec::with_capacity(4 * 4096),
+        output,
+        root: registry.root_element(),
+    };
+    generator.emit()
 }
 
-pub fn generate_commands<W: std::io::Write>(
-    root: roxmltree::Node,
-    output: &mut W,
-    buffer: &mut Vec<u8>,
-) -> std::io::Result<()> {
-    let mut params = Vec::with_capacity(128);
-    filter(root, "commands")
-        .flat_map(|commands| filter(commands, "command"))
-        .try_for_each(|command| generate_command(command, &mut params, output, buffer))
+pub struct Generator<'i, W> {
+    buffer: Vec<u8>,
+    output: W,
+    root: roxmltree::Node<'i, 'i>,
 }
 
-pub fn generate_command<'n, W: std::io::Write>(
+impl<'i, W: std::io::Write> Generator<'i, W> {
+    fn drain_write_all(&mut self) -> std::io::Result<()> {
+        self.output.write_all(&self.buffer)?;
+        self.buffer.clear();
+        Ok(())
+    }
+
+    pub fn emit(mut self) -> std::io::Result<()> {
+        self.emit_constants()?;
+        self.emit_handles()?;
+
+        self.emit_structs()?;
+        self.emit_enums()?;
+        self.emit_commands()?;
+        self.emit_extensions()?;
+        self.emit_aliases()
+    }
+
+    pub fn emit_aliases(&mut self) -> std::io::Result<()> {
+        let aliases = filter(self.root, "types")
+            .flat_map(|t| filter(t, "type"))
+            .filter_map(|t| t.attribute("name").zip(t.attribute("alias")));
+
+        self.buffer.extend_from_slice(b"// Aliases\n");
+        aliases.for_each(|(name, alias)| {
+            self.buffer.extend_from_slice(b"pub type ");
+            vk2rt(name, &mut self.buffer);
+            self.buffer.extend_from_slice(b" = ");
+            vk2rt(alias, &mut self.buffer);
+            self.buffer.extend_from_slice(b";\n");
+        });
+
+        self.drain_write_all()
+    }
+
+    // TODO: Move `generate_command` inside the generator
+    pub fn emit_commands(&mut self) -> std::io::Result<()> {
+        let mut params = Vec::with_capacity(128);
+
+        self.buffer.extend_from_slice(b"// Commands\n");
+        filter(self.root, "commands")
+            .flat_map(|commands| filter(commands, "command"))
+            .for_each(|command| generate_command(command, &mut params, &mut self.buffer));
+
+        self.buffer.push(b'\n');
+        self.drain_write_all()
+    }
+
+    pub fn emit_constants(&mut self) -> std::io::Result<()> {
+        let constants = filter(self.root, "enums")
+            .find(|e| matches!(e.attribute("name"), Some("API Constants")));
+        let node = if let Some(n) = constants {
+            n
+        } else {
+            return Ok(());
+        };
+
+        let mut enums = Vec::new();
+        // Set up a buffer to hold previous constants in order to account for proper types in
+        // aliases
+        let mut constants = Vec::with_capacity(64);
+
+        enums.extend(filter(node, "enum").filter_map(|e| generate_variant(e, None)));
+
+        self.buffer.extend_from_slice(b"// Constants\n");
+        enums.drain(..).for_each(|e| {
+            self.buffer.extend_from_slice(b"pub const ");
+
+            let name = if e.name.starts_with("VK_") {
+                e.name.get(3..).unwrap_or(e.name)
+            } else {
+                e.name
+            };
+            self.buffer.extend_from_slice(name.as_bytes());
+
+            match e.value {
+                EnumerantValue::Alias(alias) => {
+                    self.buffer.extend_from_slice(b": ");
+                    let t = constants
+                        .iter()
+                        .find_map(|&(t, name)| if name == alias { Some(t) } else { None })
+                        .unwrap_or("u32");
+                    self.buffer.extend_from_slice(t.as_bytes());
+                    self.buffer.extend_from_slice(b" = ");
+                    let value = if alias.starts_with("VK_") {
+                        alias.get(3..).unwrap_or(alias)
+                    } else {
+                        alias
+                    };
+                    self.buffer.extend_from_slice(value.as_bytes());
+                }
+                EnumerantValue::BitPos(bpos) => {
+                    self.buffer.extend_from_slice(b": u32 = ");
+                    let value = format!("{}", bpos);
+                    self.buffer.extend_from_slice(value.as_bytes());
+                    constants.push(("u32", name));
+                }
+                EnumerantValue::Extension { .. } => {
+                    eprintln!("ERROR: Constant with extension found!")
+                }
+                EnumerantValue::Integer(i) => {
+                    let mut value = if i.bytes().any(|b| b == b'~') {
+                        i.replace('~', "!")
+                    } else {
+                        i.to_string()
+                    };
+
+                    let mut t = "u32";
+                    if value.contains("ULL") {
+                        t = "u64";
+                        value = value.replace("ULL", "");
+                    }
+
+                    if name.contains("SIZE") {
+                        t = "usize";
+                    }
+
+                    if value.bytes().any(|b| b == b'f') {
+                        t = "f32";
+                        value = value.replace("f", "");
+                    }
+
+                    if value.bytes().any(|b| b == b'U') {
+                        value = value.replace("U", "");
+                    }
+
+                    self.buffer.extend_from_slice(b": ");
+                    self.buffer.extend_from_slice(t.as_bytes());
+                    self.buffer.extend_from_slice(b" = ");
+                    self.buffer.extend_from_slice(value.as_bytes());
+                    constants.push((t, e.name));
+                }
+            }
+            self.buffer.extend_from_slice(b";\n");
+        });
+
+        self.buffer.push(b'\n');
+        self.drain_write_all()
+    }
+
+    pub fn emit_enums(&mut self) -> std::io::Result<()> {
+        // TODO: Maybe count how many enums and their corresponding variants we have.
+        let mut map = std::collections::HashMap::with_capacity(512);
+
+        let enums =
+            filter(self.root, "enums").filter_map(|e| e.attribute("name").map(|attr| (e, attr)));
+        // TODO: Separate constant generation from enum generation
+        for (node, name) in enums {
+            if name != "API Constants" {
+                let mut enumerants = Vec::with_capacity(256);
+                enumerants.extend(filter(node, "enum").filter_map(|e| generate_variant(e, None)));
+                map.insert(name, enumerants);
+            }
+        }
+
+        generate_extended_enums(self.root, &mut map);
+        for (name, variants) in map {
+            if !variants.is_empty() {
+                emit_enum(name, variants, &mut self.buffer);
+                self.buffer.push(b'\n');
+            }
+        }
+
+        self.drain_write_all()
+    }
+
+    // TODO: Store commands, constants, and structs in memory and emit them in an organized format
+    pub fn emit_extensions(&mut self) -> std::io::Result<()> {
+        let extensions = filter(self.root, "extensions")
+            .flat_map(|ext| filter(ext, "extension"))
+            .filter_map(|ext| {
+                if !matches!(ext.attribute("supported"), Some("disabled")) {
+                    ext.attribute("name").map(|n| (ext, n))
+                } else {
+                    None
+                }
+            });
+
+        for (ext, name) in extensions {
+            eprintln!("// {}", name);
+
+            let elements = filter(ext, "require").flat_map(|req| {
+                req.children().filter(|c| {
+                    let name = c.tag_name().name();
+                    c.is_element() && ((name == "type") || (name == "enum") || (name == "command"))
+                })
+            });
+
+            for element in elements {
+                let name = element.tag_name().name();
+                if name == "enum" && element.attribute("extends").is_none() {
+                    if let Some(name) = element.attribute("name") {
+                        if name.ends_with("EXTENSION_NAME") {
+                            if let Some(value) = element.attribute("value") {
+                                let len = name.len() - "_EXTENSION_NAME".len();
+                                eprintln!(
+                                    "pub const {}: &str = {}\\u{{0}}\";",
+                                    &name[3..len],
+                                    &value[..value.len() - 1]
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            eprintln!();
+        }
+
+        Ok(())
+    }
+
+    pub fn emit_handles(&mut self) -> std::io::Result<()> {
+        let handles = filter(self.root, "types")
+            .flat_map(|t| filter(t, "type"))
+            .filter_map(|t| {
+                let mut result = None;
+
+                if let Some(category) = t.attribute("category") {
+                    if category == "handle" {
+                        result = t.attribute("name").or_else(|| {
+                            t.children()
+                                .find(|c| c.tag_name().name() == "name")
+                                .and_then(|n| n.text())
+                        });
+                    }
+                }
+
+                result
+            });
+
+        self.buffer.extend_from_slice(b"// Handles\n");
+        for name in handles {
+            self.buffer.extend_from_slice(b"#[repr(C)]\n");
+            self.buffer.extend_from_slice(b"#[derive(Clone, Copy)]\n");
+            self.buffer.extend_from_slice(b"pub struct ");
+            vk2rt(name, &mut self.buffer);
+            self.buffer.extend_from_slice(b" {\n");
+            self.buffer.extend_from_slice(b"    _data: [u8; 0],\n");
+            self.buffer.extend_from_slice(
+                b"    _marker: core::marker::PhantomData<(*mut u8, core::marker::PhantomPinned)>,\n",
+            );
+            self.buffer.extend_from_slice(b"}\n\n");
+        }
+
+        self.drain_write_all()
+    }
+
+    pub fn emit_structs(&mut self) -> std::io::Result<()> {
+        let structs = filter(self.root, "types")
+            .flat_map(|t| t.children().filter(roxmltree::Node::is_element))
+            .filter(|t| matches!(t.attribute("category"), Some("struct")))
+            .filter_map(|s| s.attribute("name").map(|name| (s, name)));
+
+        self.buffer.extend_from_slice(b"// Structures\n");
+        structs.for_each(|(s, name)| {
+            if generate_struct(&mut self.buffer, name, s) {
+                self.buffer.push(b'\n');
+            }
+        });
+
+        self.drain_write_all()
+    }
+
+    pub fn new(capacity: usize, output: W, root: roxmltree::Node<'i, 'i>) -> Self {
+        Self {
+            buffer: Vec::with_capacity(capacity),
+            output,
+            root,
+        }
+    }
+}
+
+pub fn generate_command<'n>(
     command: roxmltree::Node<'n, 'n>,
     params: &mut Vec<FunctionSection<'n>>,
-    output: &mut W,
     buffer: &mut Vec<u8>,
-) -> std::io::Result<()> {
+) {
     let alias = command.attribute("name").zip(command.attribute("alias"));
 
     // There are two forms of the command tag:
@@ -114,9 +380,6 @@ pub fn generate_command<'n, W: std::io::Write>(
         buffer.extend_from_slice(b" = ");
         vk2rt(alias, buffer);
         buffer.extend_from_slice(b";\n");
-
-        output.write_all(buffer)?;
-        buffer.clear();
     } else {
         let prototype = command
             .children()
@@ -152,13 +415,8 @@ pub fn generate_command<'n, W: std::io::Write>(
                 vk2rt(p.type_name, buffer);
             }
             buffer.extend_from_slice(b";\n");
-
-            output.write_all(buffer)?;
-            buffer.clear();
         }
     }
-
-    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -180,120 +438,6 @@ impl<'s> FunctionSection<'s> {
         name.zip(type_name)
             .map(|(name, type_name)| Self { name, type_name })
     }
-}
-
-fn generate_constants<'c>(node: roxmltree::Node<'c, 'c>, buf: &mut Vec<u8>) -> bool {
-    let mut enums = Vec::new();
-    // Set up a buffer to hold previous constants in order to account for proper types in aliases
-    let mut constants = Vec::with_capacity(64);
-
-    enums.extend(filter(node, "enum").filter_map(|e| generate_variant(e, None)));
-    enums.drain(..).for_each(|e| {
-        buf.extend_from_slice(b"pub const ");
-
-        let name = if e.name.starts_with("VK_") {
-            e.name.get(3..).unwrap_or(e.name)
-        } else {
-            e.name
-        };
-        buf.extend_from_slice(name.as_bytes());
-
-        match e.value {
-            EnumerantValue::Alias(alias) => {
-                buf.extend_from_slice(b": ");
-                let t = constants
-                    .iter()
-                    .find_map(|&(t, name)| if name == alias { Some(t) } else { None })
-                    .unwrap_or("u32");
-                buf.extend_from_slice(t.as_bytes());
-                buf.extend_from_slice(b" = ");
-                let value = if alias.starts_with("VK_") {
-                    alias.get(3..).unwrap_or(alias)
-                } else {
-                    alias
-                };
-                buf.extend_from_slice(value.as_bytes());
-            }
-            EnumerantValue::BitPos(bpos) => {
-                buf.extend_from_slice(b": u32 = ");
-                let value = format!("{}", bpos);
-                buf.extend_from_slice(value.as_bytes());
-                constants.push(("u32", name));
-            }
-            EnumerantValue::Extension { .. } => eprintln!("ERROR: Constant with extension found!"),
-            EnumerantValue::Integer(i) => {
-                let i = if i.bytes().any(|b| b == b'~') {
-                    i.replace('~', "!")
-                } else {
-                    i.to_string()
-                };
-
-                let (t, value) = if name.contains("SIZE") {
-                    ("usize", i)
-                } else if i.contains("ULL") {
-                    ("u64", i.replace("ULL", ""))
-                } else if i.contains('f') {
-                    ("f32", i.replace("f", ""))
-                } else if i.bytes().any(|b| b == b'U') {
-                    ("u32", i.replace("U", ""))
-                } else {
-                    ("u32", i)
-                };
-
-                buf.extend_from_slice(b": ");
-                buf.extend_from_slice(t.as_bytes());
-                buf.extend_from_slice(b" = ");
-                buf.extend_from_slice(value.as_bytes());
-                constants.push((t, e.name));
-            }
-        }
-        buf.extend_from_slice(b";\n");
-    });
-
-    true
-}
-
-fn generate_enums<W: std::io::Write>(
-    root: roxmltree::Node,
-    output: &mut W,
-    buffer: &mut Vec<u8>,
-) -> std::io::Result<()> {
-    // TODO: Maybe count how many enums and their corresponding variants we have.
-    let mut map = std::collections::HashMap::with_capacity(512);
-
-    let enums = filter(root, "enums").filter_map(|e| e.attribute("name").map(|attr| (e, attr)));
-    // TODO: Separate constant generation from enum generation
-    for (node, name) in enums {
-        let emitted = if name == "API Constants" {
-            generate_constants(node, buffer)
-        } else {
-            let mut enumerants = Vec::with_capacity(256);
-            enumerants.extend(filter(node, "enum").filter_map(|e| generate_variant(e, None)));
-            map.insert(name, enumerants);
-
-            false
-        };
-
-        if emitted {
-            buffer.push(b'\n');
-            output.write_all(buffer)?;
-            buffer.clear();
-        }
-    }
-
-    generate_extended_enums(root, &mut map);
-    for (name, variants) in map {
-        if !variants.is_empty() {
-            buffer.clear();
-            emit_enum(name, variants, buffer);
-            buffer.push(b'\n');
-
-            output.write_all(buffer)?;
-        }
-    }
-
-    buffer.clear();
-    Ok(())
 }
 
 pub fn generate_extended_enums<'n>(
@@ -326,89 +470,6 @@ pub fn generate_extended_enums<'n>(
             }
         }
     }
-}
-
-// TODO: Store commands, constants, and structs in memory and emit them in an organized format
-pub fn generate_extensions<W: std::io::Write>(
-    root: roxmltree::Node,
-    _output: &mut W,
-    _buffer: &mut Vec<u8>,
-) -> std::io::Result<()> {
-    let extensions = filter(root, "extensions")
-        .flat_map(|ext| filter(ext, "extension"))
-        .filter_map(|ext| {
-            if !matches!(ext.attribute("supported"), Some("disabled")) {
-                ext.attribute("name").map(|n| (ext, n))
-            } else {
-                None
-            }
-        });
-
-    for (ext, name) in extensions {
-        eprintln!("// {}", name);
-
-        let elements = filter(ext, "require").flat_map(|req| {
-            req.children().filter(|c| {
-                let name = c.tag_name().name();
-                c.is_element() && ((name == "type") || (name == "enum") || (name == "command"))
-            })
-        });
-
-        for element in elements {
-            let name = element.tag_name().name();
-            if name == "enum" && element.attribute("extends").is_none() {
-                if let Some(name) = element.attribute("name") {
-                    if name.ends_with("EXTENSION_NAME") {
-                        if let Some(value) = element.attribute("value") {
-                            let len = name.len() - "_EXTENSION_NAME".len();
-                            eprintln!(
-                                "pub const {}: &str = {}\\u{{0}}\";",
-                                &name[3..len],
-                                &value[..value.len() - 1]
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        eprintln!();
-    }
-
-    Ok(())
-}
-
-fn generate_structs<W: std::io::Write>(
-    root: roxmltree::Node,
-    output: &mut W,
-    buffer: &mut Vec<u8>,
-) -> std::io::Result<()> {
-    let elements = filter(root, "types")
-        .flat_map(|t| t.children().filter(|t| t.is_element()))
-        .filter_map(|e| {
-            e.attribute("category")
-                .zip(e.attribute("name"))
-                .map(|(c, n)| (e, c, n))
-        });
-
-    for (node, category, name) in elements {
-        if let Some(alias) = node.attribute("alias") {
-            buffer.extend_from_slice(b"pub type ");
-            vk2rt(name, buffer);
-            buffer.extend_from_slice(b" = ");
-            vk2rt(alias, buffer);
-            buffer.extend_from_slice(b";\n\n");
-
-            output.write_all(buffer)?;
-            buffer.clear();
-        } else if (category == "struct") && generate_struct(buffer, name, node) {
-            buffer.push(b'\n');
-            output.write_all(buffer)?;
-            buffer.clear();
-        }
-    }
-
-    Ok(())
 }
 
 fn generate_struct(buffer: &mut Vec<u8>, name: &str, node: roxmltree::Node) -> bool {
