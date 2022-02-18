@@ -3,12 +3,15 @@
 //       one.
 // [X] - Emit Vulkan commands
 // [X] - Emit Vulkan handles
-// [ ] - Remove extra indirection - we first write to buffer, then we copy from buffer into output
-// [ ] - Emit Vulkan extensions
-//     [ ] - Emit constants
-//     [X] - Emit enumerations
-//     [ ] - Emit structures
+// [ ] - Emit proper type in structures for handles.
+// [ ] - Store all identifiers in memory and emit in an organised format.
+// [ ] - Emit extensions
+//     [ ] - Constants
+//     [X] - Enumerations
+//     [ ] - Structures
+// [ ] - Emit features
 // [ ] - Generate function pointer loading library
+// [ ] - Remove extra indirection - we first write to buffer, then we copy from buffer into output
 
 const BASIC_C_TYPE: [&str; 12] = [
     "void", "char", "float", "double", "uint8_t", "uint16_t", "uint32_t", "uint64_t", "int32_t",
@@ -57,10 +60,7 @@ fn main() -> std::io::Result<()> {
             .unwrap_or_else(|| String::from("vk.xml"));
         match std::fs::read_to_string(&path) {
             Ok(source) => match roxmltree::Document::parse(&source) {
-                Ok(registry) => {
-                    let mut writer = std::io::BufWriter::new(output);
-                    process(registry, &mut writer)?
-                }
+                Ok(registry) => process(registry, std::io::BufWriter::new(output))?,
                 Err(e) => eprintln!("Failed to parse Vulkan XML registry!\n{}", e),
             },
             Err(e) => eprintln!(
@@ -99,6 +99,10 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
     }
 
     pub fn emit(mut self) -> std::io::Result<()> {
+        // Add imports at the very top
+        self.buffer
+            .extend_from_slice(b"use std::{ffi::c_void, os::raw::c_char};\n\n");
+
         self.emit_constants()?;
         self.emit_handles()?;
 
@@ -126,7 +130,6 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
         self.drain_write_all()
     }
 
-    // TODO: Move `generate_command` inside the generator
     pub fn emit_commands(&mut self) -> std::io::Result<()> {
         let mut params = Vec::with_capacity(128);
 
@@ -235,18 +238,27 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
         // TODO: Maybe count how many enums and their corresponding variants we have.
         let mut map = std::collections::HashMap::with_capacity(512);
 
-        let enums =
-            filter(self.root, "enums").filter_map(|e| e.attribute("name").map(|attr| (e, attr)));
-        // TODO: Separate constant generation from enum generation
-        for (node, name) in enums {
-            if name != "API Constants" {
-                let mut enumerants = Vec::with_capacity(256);
-                enumerants.extend(filter(node, "enum").filter_map(|e| generate_variant(e, None)));
-                map.insert(name, enumerants);
+        let enums = filter(self.root, "enums").filter_map(|e| {
+            let mut result = None;
+
+            if let Some(name) = e.attribute("name") {
+                if name != "API Constants" {
+                    result = Some((e, name));
+                }
             }
+
+            result
+        });
+
+        for (node, name) in enums {
+            let mut enumerants = Vec::with_capacity(256);
+            enumerants.extend(filter(node, "enum").filter_map(|e| generate_variant(e, None)));
+            map.insert(name, enumerants);
         }
 
         generate_extended_enums(self.root, &mut map);
+
+        self.buffer.extend(b"// Enumerations\n");
         for (name, variants) in map {
             if !variants.is_empty() {
                 emit_enum(name, variants, &mut self.buffer);
@@ -341,16 +353,27 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
 
     pub fn emit_structs(&mut self) -> std::io::Result<()> {
         let structs = filter(self.root, "types")
-            .flat_map(|t| t.children().filter(roxmltree::Node::is_element))
-            .filter(|t| matches!(t.attribute("category"), Some("struct")))
+            .flat_map(|t| t.children().filter(|c| c.is_element()))
+            .filter(|t| {
+                let mut result = false;
+
+                if let Some(category) = t.attribute("category") {
+                    if (category == "struct") && t.attribute("alias").is_none() {
+                        result = true;
+                    }
+                }
+
+                result
+            })
             .filter_map(|s| s.attribute("name").map(|name| (s, name)));
 
+        let mut type_buffer = String::with_capacity(256);
         self.buffer.extend_from_slice(b"// Structures\n");
-        structs.for_each(|(s, name)| {
-            if generate_struct(&mut self.buffer, name, s) {
+        for (s, name) in structs {
+            if generate_struct(&mut self.buffer, &mut type_buffer, name, s) {
                 self.buffer.push(b'\n');
             }
-        });
+        }
 
         self.drain_write_all()
     }
@@ -472,19 +495,35 @@ pub fn generate_extended_enums<'n>(
     }
 }
 
-fn generate_struct(buffer: &mut Vec<u8>, name: &str, node: roxmltree::Node) -> bool {
+// TODO: Keep a list of the handles!
+//
+// If any of the member types have a pointer to a handle or the name of the handle itself we need to
+// add a pointer to the type since we don't hide the fact that the handles are pointers in our Rust
+// API.
+fn generate_struct(
+    buffer: &mut Vec<u8>,
+    type_buffer: &mut String,
+    name: &str,
+    node: roxmltree::Node,
+) -> bool {
     // Do not emit these placeholder structures
     if (name == "VkBaseInStructure") || (name == "VkBaseOutStructure") {
         return false;
     }
 
+    // Need to keep the original length of the buffer around because we might need to bail in the
+    // middle of generating the struct since we don't support emitting structs with bitfields right
+    // now.
+    //
+    // With this length, we can `truncate` the buffer later on when we need to bail.
+    let length = buffer.len();
+
+    // Insert the structure header
     buffer.extend_from_slice(b"#[derive(Clone, Copy)]\n");
     buffer.extend_from_slice(b"#[repr(C)]\n");
     buffer.extend_from_slice(b"pub struct ");
     vk2rt(name, buffer);
     buffer.extend_from_slice(b" {");
-
-    let mut type_buffer = String::with_capacity(128);
 
     for member in filter(node, "member") {
         buffer.extend_from_slice(b"\n   ");
@@ -510,10 +549,11 @@ fn generate_struct(buffer: &mut Vec<u8>, name: &str, node: roxmltree::Node) -> b
             }
         }
 
-        let tokens = tokenize_c_type(&type_buffer);
-        // Do not generate the struct if we have a member that is a bit-field.
+        let tokens = tokenize_c_type(type_buffer);
+
+        // Need to bail. Do not generate the struct if we have a member that is a bit-field.
         if tokens.iter().any(|t| *t == CToken::Colon) {
-            buffer.clear();
+            buffer.truncate(length);
             return false;
         }
 
@@ -571,7 +611,7 @@ pub fn filter<'b, 'n>(
     name: &'b str,
 ) -> impl Iterator<Item = roxmltree::Node<'b, 'n>> {
     node.children()
-        .filter(move |child| child.is_element() && name == child.tag_name().name())
+        .filter(move |child| child.is_element() && (name == child.tag_name().name()))
 }
 
 pub fn find<'n>(node: roxmltree::Node<'n, 'n>, name: &str) -> Option<roxmltree::Node<'n, 'n>> {
@@ -736,27 +776,23 @@ enum CQualifier {
 fn vk2rm(buffer: &mut Vec<u8>, mut name: &str) {
     if name == "sType" {
         // Special case for `sType`. We cannot truncate to `type` since it is a Rust keyword so we
-        // keep the prefix and just change it to snake_case.
-        buffer.extend_from_slice(b"s_type");
+        // keep the prefix.
+        buffer.extend_from_slice(b"stype");
     } else {
         // Do we have a Hungarian-notation prefix?
-        let mut lowers = 0;
-        for b in name.bytes() {
-            if b.is_ascii_lowercase() {
-                lowers += 1;
-            } else {
-                break;
-            }
-        }
+        let prefixes = ["pp", "pfn"];
 
-        if lowers > 0 {
-            if let Some(s) = name.get(lowers..) {
-                let prefixes = ["pp", "pfn"];
-                if !s.is_empty()
-                    && ((lowers == 1) || prefixes.iter().any(|&p| p == &name[..lowers]))
-                {
-                    name = s;
-                }
+        // Count how many lowercase letters we start with in the camelCase member name
+        let lowers = name
+            .bytes()
+            .position(|b| b.is_ascii_uppercase())
+            .unwrap_or(name.len());
+
+        let prefix = name.get(..lowers);
+        let rem = name.get(lowers..);
+        if let Some((prefix, rem)) = prefix.zip(rem) {
+            if !rem.is_empty() && ((lowers == 1) || prefixes.iter().any(|&p| p == prefix)) {
+                name = rem;
             }
         }
 
@@ -775,19 +811,16 @@ fn vk2rt(name: &str, buffer: &mut Vec<u8>) {
 
         // Find consecutive capitals at the end of the type name, e.g. `EXT`, `KHR`, `NV`, etc.
         // and convert them to PascalCase
-        let mut ncaps = 0;
-        for b in name.bytes().rev() {
-            if b.is_ascii_uppercase() {
-                ncaps += 1;
-            } else {
-                break;
-            }
-        }
+        let caps = name
+            .bytes()
+            .rev()
+            .position(|b| !b.is_ascii_uppercase())
+            .unwrap_or(name.len());
 
         let len = name.len();
-        if (ncaps > 1) && (ncaps <= len - plen) {
-            buffer.extend(name.bytes().skip(plen).take(len - ncaps - plen));
-            c2pc(buffer, name.bytes().skip(len - ncaps))
+        if (caps > 1) && (caps <= len - plen) {
+            buffer.extend(name.bytes().skip(plen).take(len - caps - plen));
+            c2pc(buffer, name.bytes().skip(len - caps))
         } else {
             buffer.extend(name.bytes().skip(plen));
         }
@@ -819,8 +852,10 @@ fn vk2rv(name: &str, variants: &[Enumerant], w: &mut Vec<u8>) {
             buffer.extend_from_slice(b"// ");
         }
 
-        // TODO: Individual variants could have the suffix but it could be the case that it is not
-        // shared across all variants. This means that we cannot strip it.
+        // TODO: Better suffix removal logic.
+        //
+        // Individual variants could have the suffix but it could be the case that it is not shared
+        // across all variants. This means that we cannot strip it.
         let name = strip_prefix(v.name, &prefix).unwrap_or(v.name);
         ssc2cc(&mut buffer, name.bytes());
 
