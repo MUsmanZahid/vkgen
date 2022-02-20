@@ -185,19 +185,19 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
 
         for (node, name) in enums {
             let mut enumerants = Vec::with_capacity(256);
-            enumerants.extend(filter(node, "enum").filter_map(|e| generate_variant(e, None)));
+            enumerants.extend(filter(node, "enum").filter_map(Enumerant::from_core_node));
             map.insert(name, enumerants);
         }
 
         generate_extended_enums(self.root, &mut map);
 
         self.buffer.extend(b"// Enumerations\n");
-        for (name, variants) in map {
-            if !variants.is_empty() {
+        map.into_iter()
+            .filter(|(_, variants)| !variants.is_empty())
+            .for_each(|(name, variants)| {
                 emit_enum(name, variants, &mut self.buffer);
                 self.buffer.push(b'\n');
-            }
-        }
+            });
 
         self.drain_write_all()
     }
@@ -319,8 +319,7 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
         let node = filter(self.root, "enums")
             .find(|e| matches!(e.attribute("name"), Some("API Constants")));
         if let Some(n) = node {
-            let constants = filter(n, "enum")
-                .filter_map(|e| generate_variant(e, None).and_then(Constant::try_from_enumerant));
+            let constants = filter(n, "enum").filter_map(Constant::from_node);
             buffer.extend(constants);
             Constant::resolve_types(&mut buffer);
         }
@@ -382,12 +381,14 @@ impl<'c> Constant<'c> {
         }
     }
 
-    pub fn try_from_enumerant(e: Enumerant<'c>) -> Option<Self> {
-        NonExtensionVariant::from_variant(e.value).map(|value| Self {
-            name: e.name,
-            rtype: "u32",
-            value,
-        })
+    pub fn from_node(node: roxmltree::Node<'c, 'c>) -> Option<Self> {
+        node.attribute("name")
+            .zip(NonExtensionVariant::from_node(node))
+            .map(|(name, value)| Self {
+                name,
+                rtype: "u32",
+                value,
+            })
     }
 }
 
@@ -399,13 +400,20 @@ pub enum NonExtensionVariant<'v> {
 }
 
 impl<'v> NonExtensionVariant<'v> {
-    pub fn from_variant(v: EnumerantValue<'v>) -> Option<Self> {
-        match v {
-            EnumerantValue::Alias(a) => Some(Self::Alias(a)),
-            EnumerantValue::BitPos(b) => Some(Self::BitPosition(b)),
-            EnumerantValue::Extension { .. } => None,
-            EnumerantValue::Integer(i) => Some(Self::Integer(i)),
+    pub fn from_node(node: roxmltree::Node<'v, 'v>) -> Option<Self> {
+        let mut result = None;
+
+        if node.tag_name().name() == "enum" {
+            if let Some(value) = node.attribute("value") {
+                result = Some(Self::Integer(value));
+            } else if let Some(b) = node.attribute("bitpos") {
+                result = b.parse().ok().map(Self::BitPosition);
+            } else if let Some(alias) = node.attribute("alias") {
+                result = Some(Self::Alias(alias));
+            }
         }
+
+        result
     }
 
     pub fn sanitize(&self) -> std::borrow::Cow<'v, str> {
@@ -528,24 +536,28 @@ pub fn generate_extended_enums<'n>(
         .filter(|ext| !matches!(ext.attribute("supported"), Some("disabled")));
 
     for ext in extensions {
-        let extnum = ext.attribute("number");
-        let variants = filter(ext, "require")
-            .flat_map(|req| filter(req, "enum"))
-            .filter(|e| {
-                let name = e
-                    .attribute("name")
-                    .map(|n| !n.ends_with("SPEC_VERSION") && !n.ends_with("EXTENSION_NAME"));
-                matches!(name, Some(true))
-            })
-            .filter_map(|e| e.attribute("extends").zip(generate_variant(e, extnum)));
+        if let Some(extnum) = ext.attribute("number") {
+            let variants = filter(ext, "require")
+                .flat_map(|req| filter(req, "enum"))
+                .filter(|e| {
+                    let name = e
+                        .attribute("name")
+                        .map(|n| !n.ends_with("SPEC_VERSION") && !n.ends_with("EXTENSION_NAME"));
+                    matches!(name, Some(true))
+                })
+                .filter_map(|e| {
+                    e.attribute("extends")
+                        .zip(Enumerant::from_extension_node(e, extnum))
+                });
 
-        for (extends, variant) in variants {
-            if let Some(value) = map.get_mut(extends) {
-                value.push(variant);
-            } else {
-                let mut value = Vec::with_capacity(256);
-                value.push(variant);
-                map.insert(extends, value);
+            for (extends, variant) in variants {
+                if let Some(value) = map.get_mut(extends) {
+                    value.push(variant);
+                } else {
+                    let mut value = Vec::with_capacity(256);
+                    value.push(variant);
+                    map.insert(extends, value);
+                }
             }
         }
     }
@@ -618,33 +630,106 @@ fn generate_struct(
     true
 }
 
-fn generate_variant<'v>(
-    node: roxmltree::Node<'v, 'v>,
-    extension_number: Option<&'v str>,
-) -> Option<Enumerant<'v>> {
-    let name = node.attribute("name")?;
+#[derive(Clone, Debug)]
+pub struct Enumerant<'e> {
+    pub name: &'e str,
+    pub value: Variant<'e>,
+}
 
-    let value = if let Some(value) = node.attribute("value") {
-        Some(EnumerantValue::Integer(value))
-    } else if let Some(bitpos) = node.attribute("bitpos") {
-        bitpos.parse().ok().map(EnumerantValue::BitPos)
-    } else if let Some(alias) = node.attribute("alias") {
-        Some(EnumerantValue::Alias(alias))
-    } else if let Some(offset) = node.attribute("offset") {
-        let number = extension_number.or_else(|| node.attribute("extnumber"))?;
-        let direction = node.attribute("dir");
+impl<'e> Enumerant<'e> {
+    pub fn from_core_node(node: roxmltree::Node<'e, 'e>) -> Option<Self> {
+        node.attribute("name")
+            .zip(Variant::from_core_node(node))
+            .map(|(name, value)| Self { name, value })
+    }
 
-        let ext = EnumerantValue::Extension {
-            number,
-            offset,
-            direction,
-        };
-        Some(ext)
-    } else {
-        None
-    };
+    pub fn from_extension_node(node: roxmltree::Node<'e, 'e>, ext_num: &'e str) -> Option<Self> {
+        Self::from_core_node(node).or_else(|| {
+            node.attribute("name")
+                .zip(Variant::from_extension_node(node, ext_num))
+                .map(|(name, value)| Self { name, value })
+        })
+    }
+}
 
-    value.map(|value| Enumerant { name, value })
+#[derive(Clone, Copy, Debug)]
+pub enum Variant<'v> {
+    Alias(&'v str),
+    BitPos(u32),
+    Extension {
+        number: &'v str,
+        offset: &'v str,
+        direction: Option<&'v str>,
+    },
+    Integer(&'v str),
+}
+
+impl<'v> Variant<'v> {
+    pub fn from_core_node(node: roxmltree::Node<'v, 'v>) -> Option<Self> {
+        if let Some(value) = node.attribute("value") {
+            Some(Self::Integer(value))
+        } else if let Some(b) = node.attribute("bitpos") {
+            b.parse().ok().map(Self::BitPos)
+        } else {
+            node.attribute("alias").map(Self::Alias)
+        }
+    }
+
+    pub fn from_extension_node(node: roxmltree::Node<'v, 'v>, ext_num: &'v str) -> Option<Self> {
+        Self::from_core_node(node).or_else(|| {
+            node.attribute("offset").map(|offset| {
+                let number = ext_num;
+                let direction = node.attribute("dir");
+
+                Self::Extension {
+                    number,
+                    offset,
+                    direction,
+                }
+            })
+        })
+    }
+
+    pub fn sanitize(&self) -> std::borrow::Cow<'v, str> {
+        use std::borrow::Cow;
+
+        match self {
+            Self::Alias(a) => Cow::Borrowed(a),
+            Self::BitPos(b) => Cow::Owned(format!("0x{:X}", 0x1 << b)),
+            Self::Extension {
+                number,
+                offset,
+                direction,
+            } => {
+                // Initial offset for any extension
+                let mut value = 1_000_000_000;
+                if let Ok(number) = number.parse::<i32>() {
+                    value += (number - 1) * 1_000;
+                }
+                if let Ok(offset) = offset.parse::<i32>() {
+                    value += offset;
+                }
+                if let Some("-") = direction {
+                    value = -value;
+                }
+
+                Cow::Owned(value.to_string())
+            }
+            Self::Integer(i) => {
+                if i.contains("ULL") {
+                    Cow::Owned(i.replace("ULL", ""))
+                } else if i.bytes().any(|b| b == b'f') {
+                    Cow::Owned(i.replace("f", ""))
+                } else if i.bytes().any(|b| b == b'U') {
+                    Cow::Owned(i.replace("U", ""))
+                } else if i.bytes().any(|b| b == b'~') {
+                    Cow::Owned(i.replace('~', "!"))
+                } else {
+                    Cow::Borrowed(i)
+                }
+            }
+        }
+    }
 }
 
 pub fn emit_enum(name: &str, variants: Vec<Enumerant>, buffer: &mut Vec<u8>) {
@@ -919,7 +1004,7 @@ fn vk2rv(name: &str, variants: &[Enumerant], w: &mut Vec<u8>) {
     for v in variants {
         buffer.extend_from_slice(b"    ");
 
-        if let EnumerantValue::Alias(_) = v.value {
+        if let Variant::Alias(_) = v.value {
             // Enums cannot have duplicate discriminants so we comment out aliases
             buffer.extend_from_slice(b"// ");
         }
@@ -932,7 +1017,7 @@ fn vk2rv(name: &str, variants: &[Enumerant], w: &mut Vec<u8>) {
         ssc2cc(&mut buffer, name.bytes());
 
         buffer.extend_from_slice(b" = ");
-        if let EnumerantValue::Alias(alias) = v.value {
+        if let Variant::Alias(alias) = v.value {
             let alias = strip_prefix(alias, &prefix).unwrap_or(alias);
             ssc2cc(&mut buffer, alias.bytes());
         } else {
@@ -962,67 +1047,6 @@ fn strip_prefix<'i>(name: &'i str, prefix: &'i [u8]) -> Option<&'i str> {
             }
 
             name.get(x..)
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct Enumerant<'e> {
-    pub name: &'e str,
-    pub value: EnumerantValue<'e>,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum EnumerantValue<'v> {
-    Alias(&'v str),
-    BitPos(u32),
-    Extension {
-        number: &'v str,
-        offset: &'v str,
-        direction: Option<&'v str>,
-    },
-    Integer(&'v str),
-}
-
-impl<'v> EnumerantValue<'v> {
-    pub fn sanitize(&self) -> std::borrow::Cow<'v, str> {
-        use std::borrow::Cow;
-
-        match self {
-            Self::Alias(a) => Cow::Borrowed(a),
-            Self::BitPos(b) => Cow::Owned(format!("0x{:X}", 0x1 << b)),
-            Self::Extension {
-                number,
-                offset,
-                direction,
-            } => {
-                // Initial offset for any extension
-                let mut value = 1_000_000_000;
-                if let Ok(number) = number.parse::<i32>() {
-                    value += (number - 1) * 1_000;
-                }
-                if let Ok(offset) = offset.parse::<i32>() {
-                    value += offset;
-                }
-                if let Some("-") = direction {
-                    value = -value;
-                }
-
-                Cow::Owned(value.to_string())
-            }
-            Self::Integer(i) => {
-                if i.contains("ULL") {
-                    Cow::Owned(i.replace("ULL", ""))
-                } else if i.bytes().any(|b| b == b'f') {
-                    Cow::Owned(i.replace("f", ""))
-                } else if i.bytes().any(|b| b == b'U') {
-                    Cow::Owned(i.replace("U", ""))
-                } else if i.bytes().any(|b| b == b'~') {
-                    Cow::Owned(i.replace('~', "!"))
-                } else {
-                    Cow::Borrowed(i)
-                }
-            }
         }
     }
 }
