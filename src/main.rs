@@ -3,7 +3,7 @@
 //       one.
 // [X] - Emit Vulkan commands
 // [X] - Emit Vulkan handles
-// [ ] - Emit proper type in structures for handles.
+// [X] - Emit proper type in structures and commands for handles.
 // [ ] - Store all identifiers in memory and emit in an organised format.
 // [ ] - Emit extensions
 //     [ ] - Constants
@@ -24,11 +24,11 @@ const BASIC_RUST_TYPE: [&str; 12] = [
 const OUTPUT_FILE_NAME: &str = "vk.rs";
 
 fn main() -> std::io::Result<()> {
-    let output = match std::fs::OpenOptions::new()
+    let result = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(OUTPUT_FILE_NAME)
-    {
+        .open(OUTPUT_FILE_NAME);
+    let output = match result {
         Ok(f) => Some(f),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             print!(
@@ -99,17 +99,19 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
     }
 
     pub fn emit(mut self) -> std::io::Result<()> {
+        let constants = self.load_constants();
+
         // Add imports at the very top
         self.buffer
             .extend_from_slice(b"use std::{ffi::c_void, os::raw::c_char};\n\n");
 
-        self.emit_constants()?;
-        self.emit_handles()?;
+        self.emit_constants(constants)?;
+        let handles = self.emit_handles()?;
 
-        self.emit_structs()?;
+        self.emit_structs(&handles)?;
         self.emit_enums()?;
-        self.emit_commands()?;
-        self.emit_extensions()?;
+        self.emit_commands(&handles)?;
+        // self.emit_extensions()?;
         self.emit_aliases()
     }
 
@@ -130,105 +132,36 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
         self.drain_write_all()
     }
 
-    pub fn emit_commands(&mut self) -> std::io::Result<()> {
+    pub fn emit_commands(&mut self, handles: &[&str]) -> std::io::Result<()> {
         let mut params = Vec::with_capacity(128);
 
         self.buffer.extend_from_slice(b"// Commands\n");
         filter(self.root, "commands")
             .flat_map(|commands| filter(commands, "command"))
-            .for_each(|command| generate_command(command, &mut params, &mut self.buffer));
+            .for_each(|command| generate_command(command, &mut params, handles, &mut self.buffer));
 
         self.buffer.push(b'\n');
         self.drain_write_all()
     }
 
-    pub fn emit_constants(&mut self) -> std::io::Result<()> {
-        let constants = filter(self.root, "enums")
-            .find(|e| matches!(e.attribute("name"), Some("API Constants")));
-        let node = if let Some(n) = constants {
-            n
-        } else {
-            return Ok(());
-        };
-
-        let mut enums = Vec::new();
-        // Set up a buffer to hold previous constants in order to account for proper types in
-        // aliases
-        let mut constants = Vec::with_capacity(64);
-
-        enums.extend(filter(node, "enum").filter_map(|e| generate_variant(e, None)));
-
+    pub fn emit_constants(&mut self, constants: Vec<Constant>) -> std::io::Result<()> {
         self.buffer.extend_from_slice(b"// Constants\n");
-        enums.drain(..).for_each(|e| {
+        for constant in constants {
             self.buffer.extend_from_slice(b"pub const ");
-
-            let name = if e.name.starts_with("VK_") {
-                e.name.get(3..).unwrap_or(e.name)
+            let name = if constant.name.starts_with("VK_") {
+                constant.name.get(3..).unwrap_or(constant.name)
             } else {
-                e.name
+                constant.name
             };
             self.buffer.extend_from_slice(name.as_bytes());
+            self.buffer.extend_from_slice(b": ");
+            self.buffer.extend_from_slice(constant.rtype.as_bytes());
+            self.buffer.extend_from_slice(b" = ");
 
-            match e.value {
-                EnumerantValue::Alias(alias) => {
-                    self.buffer.extend_from_slice(b": ");
-                    let t = constants
-                        .iter()
-                        .find_map(|&(t, name)| if name == alias { Some(t) } else { None })
-                        .unwrap_or("u32");
-                    self.buffer.extend_from_slice(t.as_bytes());
-                    self.buffer.extend_from_slice(b" = ");
-                    let value = if alias.starts_with("VK_") {
-                        alias.get(3..).unwrap_or(alias)
-                    } else {
-                        alias
-                    };
-                    self.buffer.extend_from_slice(value.as_bytes());
-                }
-                EnumerantValue::BitPos(bpos) => {
-                    self.buffer.extend_from_slice(b": u32 = ");
-                    let value = format!("{}", bpos);
-                    self.buffer.extend_from_slice(value.as_bytes());
-                    constants.push(("u32", name));
-                }
-                EnumerantValue::Extension { .. } => {
-                    eprintln!("ERROR: Constant with extension found!")
-                }
-                EnumerantValue::Integer(i) => {
-                    let mut value = if i.bytes().any(|b| b == b'~') {
-                        i.replace('~', "!")
-                    } else {
-                        i.to_string()
-                    };
-
-                    let mut t = "u32";
-                    if value.contains("ULL") {
-                        t = "u64";
-                        value = value.replace("ULL", "");
-                    }
-
-                    if name.contains("SIZE") {
-                        t = "usize";
-                    }
-
-                    if value.bytes().any(|b| b == b'f') {
-                        t = "f32";
-                        value = value.replace("f", "");
-                    }
-
-                    if value.bytes().any(|b| b == b'U') {
-                        value = value.replace("U", "");
-                    }
-
-                    self.buffer.extend_from_slice(b": ");
-                    self.buffer.extend_from_slice(t.as_bytes());
-                    self.buffer.extend_from_slice(b" = ");
-                    self.buffer.extend_from_slice(value.as_bytes());
-                    constants.push((t, e.name));
-                }
-            }
+            let value = constant.value.sanitize();
+            self.buffer.extend_from_slice(value.as_bytes());
             self.buffer.extend_from_slice(b";\n");
-        });
+        }
 
         self.buffer.push(b'\n');
         self.drain_write_all()
@@ -269,7 +202,7 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
         self.drain_write_all()
     }
 
-    // TODO: Store commands, constants, and structs in memory and emit them in an organized format
+    // TODO: Store commands, and structs in memory and emit them in an organized format
     pub fn emit_extensions(&mut self) -> std::io::Result<()> {
         let extensions = filter(self.root, "extensions")
             .flat_map(|ext| filter(ext, "extension"))
@@ -315,8 +248,8 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
         Ok(())
     }
 
-    pub fn emit_handles(&mut self) -> std::io::Result<()> {
-        let handles = filter(self.root, "types")
+    pub fn emit_handles(&mut self) -> std::io::Result<Box<[&'i str]>> {
+        let handles: Box<[&str]> = filter(self.root, "types")
             .flat_map(|t| filter(t, "type"))
             .filter_map(|t| {
                 let mut result = None;
@@ -332,10 +265,11 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
                 }
 
                 result
-            });
+            })
+            .collect();
 
         self.buffer.extend_from_slice(b"// Handles\n");
-        for name in handles {
+        for name in handles.iter() {
             self.buffer.extend_from_slice(b"#[repr(C)]\n");
             self.buffer.extend_from_slice(b"#[derive(Clone, Copy)]\n");
             self.buffer.extend_from_slice(b"pub struct ");
@@ -348,10 +282,11 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
             self.buffer.extend_from_slice(b"}\n\n");
         }
 
-        self.drain_write_all()
+        self.drain_write_all()?;
+        Ok(handles)
     }
 
-    pub fn emit_structs(&mut self) -> std::io::Result<()> {
+    pub fn emit_structs(&mut self, handles: &[&str]) -> std::io::Result<()> {
         let structs = filter(self.root, "types")
             .flat_map(|t| t.children().filter(|c| c.is_element()))
             .filter(|t| {
@@ -370,12 +305,27 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
         let mut type_buffer = String::with_capacity(256);
         self.buffer.extend_from_slice(b"// Structures\n");
         for (s, name) in structs {
-            if generate_struct(&mut self.buffer, &mut type_buffer, name, s) {
+            if generate_struct(&mut self.buffer, &mut type_buffer, handles, name, s) {
                 self.buffer.push(b'\n');
             }
         }
 
         self.drain_write_all()
+    }
+
+    pub fn load_constants(&mut self) -> Vec<Constant<'i>> {
+        let mut buffer = Vec::new();
+
+        let node = filter(self.root, "enums")
+            .find(|e| matches!(e.attribute("name"), Some("API Constants")));
+        if let Some(n) = node {
+            let constants = filter(n, "enum")
+                .filter_map(|e| generate_variant(e, None).and_then(Constant::try_from_enumerant));
+            buffer.extend(constants);
+            Constant::resolve_types(&mut buffer);
+        }
+
+        buffer
     }
 
     pub fn new(capacity: usize, output: W, root: roxmltree::Node<'i, 'i>) -> Self {
@@ -387,9 +337,104 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct Constant<'c> {
+    name: &'c str,
+    rtype: &'static str,
+    value: NonExtensionVariant<'c>,
+}
+
+impl<'c> Constant<'c> {
+    pub fn resolve_types(c: &mut [Self]) {
+        for constant in c.iter_mut() {
+            let mut ctype = "u32";
+
+            if let NonExtensionVariant::Integer(i) = constant.value {
+                if i.contains("ULL") {
+                    ctype = "u64";
+                } else if i.bytes().any(|b| b == b'f') {
+                    ctype = "f32";
+                }
+
+                if constant.name.contains("SIZE") {
+                    ctype = "usize";
+                }
+            }
+
+            constant.rtype = ctype;
+        }
+
+        let aliases: Vec<_> = c
+            .iter()
+            .enumerate()
+            .filter_map(|(i, constant)| match constant.value {
+                NonExtensionVariant::Alias(alias) => {
+                    c.iter().find(|c| c.name == alias).map(|c| (i, c.rtype))
+                }
+                _ => None,
+            })
+            .collect();
+
+        for (i, ctype) in aliases {
+            if let Some(a) = c.get_mut(i) {
+                a.rtype = ctype;
+            }
+        }
+    }
+
+    pub fn try_from_enumerant(e: Enumerant<'c>) -> Option<Self> {
+        NonExtensionVariant::from_variant(e.value).map(|value| Self {
+            name: e.name,
+            rtype: "u32",
+            value,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum NonExtensionVariant<'v> {
+    Alias(&'v str),
+    BitPosition(u32),
+    Integer(&'v str),
+}
+
+impl<'v> NonExtensionVariant<'v> {
+    pub fn from_variant(v: EnumerantValue<'v>) -> Option<Self> {
+        match v {
+            EnumerantValue::Alias(a) => Some(Self::Alias(a)),
+            EnumerantValue::BitPos(b) => Some(Self::BitPosition(b)),
+            EnumerantValue::Extension { .. } => None,
+            EnumerantValue::Integer(i) => Some(Self::Integer(i)),
+        }
+    }
+
+    pub fn sanitize(&self) -> std::borrow::Cow<'v, str> {
+        use std::borrow::Cow;
+
+        match self {
+            Self::Alias(a) => Cow::Borrowed(a),
+            Self::BitPosition(b) => Cow::Owned(format!("0x{:X}", 0x1 << b)),
+            Self::Integer(i) => {
+                if i.contains("ULL") {
+                    Cow::Owned(i.replace("ULL", ""))
+                } else if i.bytes().any(|b| b == b'f') {
+                    Cow::Owned(i.replace("f", ""))
+                } else if i.bytes().any(|b| b == b'U') {
+                    Cow::Owned(i.replace("U", ""))
+                } else if i.bytes().any(|b| b == b'~') {
+                    Cow::Owned(i.replace('~', "!"))
+                } else {
+                    Cow::Borrowed(i)
+                }
+            }
+        }
+    }
+}
+
 pub fn generate_command<'n>(
     command: roxmltree::Node<'n, 'n>,
     params: &mut Vec<FunctionSection<'n>>,
+    handles: &[&str],
     buffer: &mut Vec<u8>,
 ) {
     let alias = command.attribute("name").zip(command.attribute("alias"));
@@ -429,23 +474,28 @@ pub fn generate_command<'n>(
                 }
                 vk2rm(buffer, parameter.name);
                 buffer.extend_from_slice(b": ");
-                vk2rt(parameter.type_name, buffer);
+
+                let tokens = CToken::tokenize_and_resolve_handles(&parameter.type_name, handles);
+                ct2rt(buffer, tokens);
             });
 
+            let tokens = CToken::tokenize_and_resolve_handles(&p.type_name, handles);
             buffer.push(b')');
-            if p.type_name != "void" {
+            let return_void =
+                (tokens.len() == 1) && matches!(tokens.get(0), Some(CToken::Identifier("void")));
+            if !return_void {
                 buffer.extend_from_slice(b" -> ");
-                vk2rt(p.type_name, buffer);
+                ct2rt(buffer, tokens);
             }
             buffer.extend_from_slice(b";\n");
         }
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct FunctionSection<'s> {
     pub name: &'s str,
-    pub type_name: &'s str,
+    pub type_name: String,
 }
 
 impl<'s> FunctionSection<'s> {
@@ -456,10 +506,16 @@ impl<'s> FunctionSection<'s> {
     /// 2. The name of one of the function's parameters and its corresponding type.
     pub fn extract(node: roxmltree::Node<'s, 's>) -> Option<Self> {
         let name = find(node, "name").as_ref().and_then(roxmltree::Node::text);
-        let type_name = find(node, "type").as_ref().and_then(roxmltree::Node::text);
+        let mut type_name = String::new();
+        node.children()
+            .filter(|c| c.tag_name().name() != "name")
+            .for_each(|c| {
+                if let Some(text) = c.text() {
+                    type_name.push_str(text);
+                }
+            });
 
-        name.zip(type_name)
-            .map(|(name, type_name)| Self { name, type_name })
+        name.map(|name| Self { name, type_name })
     }
 }
 
@@ -495,14 +551,10 @@ pub fn generate_extended_enums<'n>(
     }
 }
 
-// TODO: Keep a list of the handles!
-//
-// If any of the member types have a pointer to a handle or the name of the handle itself we need to
-// add a pointer to the type since we don't hide the fact that the handles are pointers in our Rust
-// API.
 fn generate_struct(
     buffer: &mut Vec<u8>,
     type_buffer: &mut String,
+    handles: &[&str],
     name: &str,
     node: roxmltree::Node,
 ) -> bool {
@@ -549,8 +601,7 @@ fn generate_struct(
             }
         }
 
-        let tokens = tokenize_c_type(type_buffer);
-
+        let tokens = CToken::tokenize_and_resolve_handles(type_buffer, handles);
         // Need to bail. Do not generate the struct if we have a member that is a bit-field.
         if tokens.iter().any(|t| *t == CToken::Colon) {
             buffer.truncate(length);
@@ -675,42 +726,6 @@ fn ct2rt(buffer: &mut Vec<u8>, tokens: Vec<CToken>) {
     }
 }
 
-fn tokenize_c_type(mut t: &str) -> Vec<CToken> {
-    let mut tokens = Vec::with_capacity(64);
-    t = t.trim();
-
-    for split in t.split_whitespace() {
-        if let CToken::TokenList(_) = CToken::from(split) {
-            if !split.is_empty() {
-                let mut start = 0;
-                for (end, c) in split.chars().enumerate() {
-                    if CToken::is_basic(c) {
-                        // We were tracking prior token before encountering this basic one so add
-                        // that first.
-                        if start < end {
-                            if let Some(s) = split.get(start..end) {
-                                tokens.push(CToken::from(s));
-                            }
-                        }
-
-                        // Add the basic token we just encountered
-                        tokens.push(CToken::from(c));
-                        start = end + 1;
-                    } else if end + 1 == split.len() {
-                        if let Some(s) = split.get(start..end + 1) {
-                            tokens.push(CToken::from(s));
-                        }
-                    }
-                }
-            }
-        } else {
-            tokens.push(CToken::from(split));
-        }
-    }
-
-    tokens
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CToken<'t> {
     BracketLeft,
@@ -726,6 +741,63 @@ enum CToken<'t> {
 impl<'t> CToken<'t> {
     pub fn is_basic(c: char) -> bool {
         (c == '[') || (c == ']') || (c == ':') || (c == '*')
+    }
+
+    pub fn tokenize(mut t: &str) -> Vec<CToken> {
+        let mut tokens = Vec::with_capacity(64);
+        t = t.trim();
+
+        for split in t.split_whitespace() {
+            if let CToken::TokenList(_) = CToken::from(split) {
+                if !split.is_empty() {
+                    let mut start = 0;
+                    for (end, c) in split.chars().enumerate() {
+                        if CToken::is_basic(c) {
+                            // We were tracking prior token before encountering this basic one so add
+                            // that first.
+                            if start < end {
+                                if let Some(s) = split.get(start..end) {
+                                    tokens.push(CToken::from(s));
+                                }
+                            }
+
+                            // Add the basic token we just encountered
+                            tokens.push(CToken::from(c));
+                            start = end + 1;
+                        } else if end + 1 == split.len() {
+                            if let Some(s) = split.get(start..end + 1) {
+                                tokens.push(CToken::from(s));
+                            }
+                        }
+                    }
+                }
+            } else {
+                tokens.push(CToken::from(split));
+            }
+        }
+
+        tokens
+    }
+
+    pub fn tokenize_and_resolve_handles(t: &'t str, handles: &[&str]) -> Vec<Self> {
+        let mut tokens = CToken::tokenize(t);
+
+        // If we have an identifier that resolves to a handle, we have to add a pointer to it since
+        // the original Vulkan api hides the fact that handles are pointers and we do not.
+        let handle_position = tokens.iter().position(|token| {
+            handles.iter().any(|handle| match token {
+                CToken::Identifier(i) => i == handle,
+                _ => false,
+            })
+        });
+
+        // Found a handle
+        if let Some(i) = handle_position {
+            // `i + 1` since C adds pointers after the identifier
+            tokens.insert(i + 1, CToken::Pointer);
+        }
+
+        tokens
     }
 }
 
