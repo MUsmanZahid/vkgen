@@ -100,6 +100,7 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
 
     pub fn emit(mut self) -> std::io::Result<()> {
         let constants = self.load_constants();
+        let structs = self.load_structs();
 
         // Add imports at the very top
         self.buffer
@@ -108,13 +109,16 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
         self.emit_constants(constants)?;
         let handles = self.emit_handles()?;
 
-        self.emit_structs(&handles)?;
+        self.emit_structs(structs, &handles)?;
         self.emit_enums()?;
         self.emit_commands(&handles)?;
         // self.emit_extensions()?;
         self.emit_aliases()
     }
 
+    // TODO: Emit all aliases.
+    //
+    // Emit aliases for structures, enums, unions, and handles.
     pub fn emit_aliases(&mut self) -> std::io::Result<()> {
         let aliases = filter(self.root, "types")
             .flat_map(|t| filter(t, "type"))
@@ -286,29 +290,45 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
         Ok(handles)
     }
 
-    pub fn emit_structs(&mut self, handles: &[&str]) -> std::io::Result<()> {
-        let structs = filter(self.root, "types")
-            .flat_map(|t| t.children().filter(|c| c.is_element()))
-            .filter(|t| {
-                let mut result = false;
+    pub fn emit_structs(&mut self, structs: Vec<Struct>, handles: &[&str]) -> std::io::Result<()> {
+        self.buffer.extend_from_slice(b"// Structures\n");
 
-                if let Some(category) = t.attribute("category") {
-                    if (category == "struct") && t.attribute("alias").is_none() {
-                        result = true;
-                    }
+        structs.into_iter().for_each(|s| {
+            // Note the length of the buffer as we might need to bail later.
+            let length = self.buffer.len();
+
+            self.buffer.extend_from_slice(b"#[repr(C)]\n");
+            self.buffer.extend_from_slice(b"#[derive(Clone, Copy)]\n");
+            self.buffer.extend_from_slice(b"pub struct ");
+
+            vk2rt(s.name, &mut self.buffer);
+            self.buffer.extend_from_slice(b" {\n");
+
+            // Emit members
+            let mut emit = true;
+            for member in s.members {
+                self.buffer.extend_from_slice(b"    pub ");
+                vk2rm(&mut self.buffer, member.name);
+                self.buffer.extend_from_slice(b": ");
+
+                let rtype = CToken::tokenize_and_resolve_handles(&member.ctype, handles);
+
+                // If we have a colon, we would need to emit a bitfield. We don't support bitfield
+                // emission currently, so skip this structure.
+                if rtype.iter().any(|&c| c == CToken::Colon) {
+                    self.buffer.truncate(length);
+                    emit = false;
+                    break;
                 }
 
-                result
-            })
-            .filter_map(|s| s.attribute("name").map(|name| (s, name)));
-
-        let mut type_buffer = String::with_capacity(256);
-        self.buffer.extend_from_slice(b"// Structures\n");
-        for (s, name) in structs {
-            if generate_struct(&mut self.buffer, &mut type_buffer, handles, name, s) {
-                self.buffer.push(b'\n');
+                ct2rt(&mut self.buffer, rtype);
+                self.buffer.extend_from_slice(b",\n");
             }
-        }
+
+            if emit {
+                self.buffer.extend_from_slice(b"}\n\n");
+            }
+        });
 
         self.drain_write_all()
     }
@@ -325,6 +345,19 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
         }
 
         buffer
+    }
+
+    pub fn load_structs(&self) -> Vec<Struct<'i>> {
+        filter(self.root, "types")
+            .flat_map(|type_node| filter(type_node, "type"))
+            .filter(|vk_struct| {
+                let category = vk_struct.attribute("category");
+                let alias = vk_struct.attribute("alias");
+
+                matches!((category, alias), (Some("struct"), None))
+            })
+            .filter_map(Struct::from_node)
+            .collect()
     }
 
     pub fn new(capacity: usize, output: W, root: roxmltree::Node<'i, 'i>) -> Self {
@@ -344,6 +377,16 @@ pub struct Constant<'c> {
 }
 
 impl<'c> Constant<'c> {
+    pub fn from_node(node: roxmltree::Node<'c, 'c>) -> Option<Self> {
+        node.attribute("name")
+            .zip(NonExtensionVariant::from_node(node))
+            .map(|(name, value)| Self {
+                name,
+                rtype: "u32",
+                value,
+            })
+    }
+
     pub fn resolve_types(c: &mut [Self]) {
         for constant in c.iter_mut() {
             let mut ctype = "u32";
@@ -379,16 +422,6 @@ impl<'c> Constant<'c> {
                 a.rtype = ctype;
             }
         }
-    }
-
-    pub fn from_node(node: roxmltree::Node<'c, 'c>) -> Option<Self> {
-        node.attribute("name")
-            .zip(NonExtensionVariant::from_node(node))
-            .map(|(name, value)| Self {
-                name,
-                rtype: "u32",
-                value,
-            })
     }
 }
 
@@ -436,6 +469,56 @@ impl<'v> NonExtensionVariant<'v> {
                 }
             }
         }
+    }
+}
+
+pub struct Struct<'s> {
+    name: &'s str,
+    members: Vec<Member<'s>>,
+}
+
+impl<'s> Struct<'s> {
+    pub fn from_node(node: roxmltree::Node<'s, 's>) -> Option<Self> {
+        let name = node.attribute("name")?;
+
+        // Do not emit these placeholder structures
+        if (name == "VkBaseInStructure") || (name == "VkBaseOutStructure") {
+            return None;
+        }
+
+        let members = filter(node, "member")
+            .filter_map(Member::from_node)
+            .collect();
+
+        let s = Self { name, members };
+        Some(s)
+    }
+}
+
+pub struct Member<'m> {
+    name: &'m str,
+    ctype: String,
+}
+
+impl<'m> Member<'m> {
+    pub fn from_node(node: roxmltree::Node<'m, 'm>) -> Option<Self> {
+        // Find all text and type nodes that constitute the full type of the member
+        let type_nodes = node
+            .children()
+            .filter(|c| c.is_text() || c.tag_name().name() == "type")
+            .filter_map(|t| t.text());
+
+        // Find the name of the member
+        let name = node
+            .children()
+            .find(|c| c.tag_name().name() == "name")
+            .map(|m| m.text())
+            .flatten();
+
+        name.map(|name| Self {
+            name,
+            ctype: type_nodes.collect(),
+        })
     }
 }
 
@@ -561,73 +644,6 @@ pub fn generate_extended_enums<'n>(
             }
         }
     }
-}
-
-fn generate_struct(
-    buffer: &mut Vec<u8>,
-    type_buffer: &mut String,
-    handles: &[&str],
-    name: &str,
-    node: roxmltree::Node,
-) -> bool {
-    // Do not emit these placeholder structures
-    if (name == "VkBaseInStructure") || (name == "VkBaseOutStructure") {
-        return false;
-    }
-
-    // Need to keep the original length of the buffer around because we might need to bail in the
-    // middle of generating the struct since we don't support emitting structs with bitfields right
-    // now.
-    //
-    // With this length, we can `truncate` the buffer later on when we need to bail.
-    let length = buffer.len();
-
-    // Insert the structure header
-    buffer.extend_from_slice(b"#[derive(Clone, Copy)]\n");
-    buffer.extend_from_slice(b"#[repr(C)]\n");
-    buffer.extend_from_slice(b"pub struct ");
-    vk2rt(name, buffer);
-    buffer.extend_from_slice(b" {");
-
-    for member in filter(node, "member") {
-        buffer.extend_from_slice(b"\n   ");
-
-        let children = member.children().filter_map(|c| {
-            if (c.is_element() || c.is_text()) && (c.tag_name().name() != "comment") {
-                c.text().map(|s| (c, s))
-            } else {
-                None
-            }
-        });
-        for (child, mut text) in children {
-            let name = child.tag_name().name();
-            text = text.trim();
-            if !text.is_empty() {
-                if name == "name" {
-                    buffer.extend_from_slice(b" pub ");
-                    vk2rm(buffer, text);
-                } else {
-                    type_buffer.push(' ');
-                    type_buffer.push_str(text);
-                }
-            }
-        }
-
-        let tokens = CToken::tokenize_and_resolve_handles(type_buffer, handles);
-        // Need to bail. Do not generate the struct if we have a member that is a bit-field.
-        if tokens.iter().any(|t| *t == CToken::Colon) {
-            buffer.truncate(length);
-            return false;
-        }
-
-        buffer.extend_from_slice(b": ");
-        ct2rt(buffer, tokens);
-        buffer.push(b',');
-        type_buffer.clear();
-    }
-
-    buffer.extend_from_slice(b"\n}\n");
-    true
 }
 
 #[derive(Clone, Debug)]
