@@ -4,11 +4,12 @@
 // [X] - Emit Vulkan commands
 // [X] - Emit Vulkan handles
 // [X] - Emit proper type in structures and commands for handles.
-// [ ] - Store all identifiers in memory and emit in an organised format.
-// [ ] - Emit extensions
-//     [ ] - Constants
+// [X] - Emit extensions
+//     [X] - Constants
 //     [X] - Enumerations
-//     [ ] - Structures
+//     [X] - Structures
+// [ ] - Emit bitmask types
+// [ ] - Store all identifiers in memory and emit in an organised format.
 // [ ] - Emit features
 // [ ] - Generate function pointer loading library
 // [ ] - Remove extra indirection - we first write to buffer, then we copy from buffer into output
@@ -31,8 +32,9 @@ fn main() -> std::io::Result<()> {
     let output = match result {
         Ok(f) => Some(f),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Ask to over-write
             print!(
-                "{} already exists. Would you like to overwrite? (Y/N): ",
+                "{} already exists. Would you like to over-write? (Y/N): ",
                 OUTPUT_FILE_NAME
             );
             <_ as std::io::Write>::flush(&mut std::io::stdout())?;
@@ -100,7 +102,8 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
 
     pub fn emit(mut self) -> std::io::Result<()> {
         let constants = self.load_constants();
-        let structs = self.load_structs();
+        let aliases = Category::resolve_aliases(self.root, self.load_aliases());
+        let structs = Category::resolve_structs(self.root, self.load_structs());
 
         // Add imports at the very top
         self.buffer
@@ -109,28 +112,30 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
         self.emit_constants(constants)?;
         let handles = self.emit_handles()?;
 
-        self.emit_structs(structs, &handles)?;
+        self.emit_structs(&structs, &handles)?;
         self.emit_enums()?;
         self.emit_commands(&handles)?;
-        // self.emit_extensions()?;
-        self.emit_aliases()
+        self.emit_aliases(&aliases)?;
+
+        self.emit_extensions(&aliases, &structs, &handles)?;
+
+        Ok(())
     }
 
-    // TODO: Emit all aliases.
-    //
-    // Emit aliases for structures, enums, unions, and handles.
-    pub fn emit_aliases(&mut self) -> std::io::Result<()> {
-        let aliases = filter(self.root, "types")
-            .flat_map(|t| filter(t, "type"))
-            .filter_map(|t| t.attribute("name").zip(t.attribute("alias")));
-
+    pub fn emit_aliases(&mut self, aliases: &[Category<Alias<'i>>]) -> std::io::Result<()> {
         self.buffer.extend_from_slice(b"// Aliases\n");
-        aliases.for_each(|(name, alias)| {
-            self.buffer.extend_from_slice(b"pub type ");
-            vk2rt(name, &mut self.buffer);
-            self.buffer.extend_from_slice(b" = ");
-            vk2rt(alias, &mut self.buffer);
-            self.buffer.extend_from_slice(b";\n");
+        aliases.iter().for_each(|alias| {
+            if let Category {
+                base,
+                sub_category: ApiCategory::Core,
+            } = alias
+            {
+                self.buffer.extend_from_slice(b"pub type ");
+                vk2rt(base.new_name, &mut self.buffer);
+                self.buffer.extend_from_slice(b" = ");
+                vk2rt(base.original_name, &mut self.buffer);
+                self.buffer.extend_from_slice(b";\n");
+            }
         });
 
         self.drain_write_all()
@@ -162,8 +167,17 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
             self.buffer.extend_from_slice(constant.rtype.as_bytes());
             self.buffer.extend_from_slice(b" = ");
 
-            let value = constant.value.sanitize();
-            self.buffer.extend_from_slice(value.as_bytes());
+            if let NonExtensionVariant::Alias(a) = constant.value {
+                let value = if a.starts_with("VK_") {
+                    a.get(3..).unwrap_or(a)
+                } else {
+                    a
+                };
+                self.buffer.extend_from_slice(value.as_bytes());
+            } else {
+                let value = constant.value.sanitize();
+                self.buffer.extend_from_slice(value.as_bytes());
+            }
             self.buffer.extend_from_slice(b";\n");
         }
 
@@ -207,7 +221,12 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
     }
 
     // TODO: Store commands, and structs in memory and emit them in an organized format
-    pub fn emit_extensions(&mut self) -> std::io::Result<()> {
+    pub fn emit_extensions(
+        &mut self,
+        aliases: &[Category<Alias>],
+        structs: &[Category<Struct>],
+        handles: &[&str],
+    ) -> std::io::Result<()> {
         let extensions = filter(self.root, "extensions")
             .flat_map(|ext| filter(ext, "extension"))
             .filter_map(|ext| {
@@ -218,6 +237,13 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
                 }
             });
 
+        // TODO: Transform this emission to the following order:
+        //
+        // 1. Constants
+        // 2. Structures
+        //  2.1 Structure Aliases
+        // 3. Commands
+        //  3.1 Command Aliases
         for (ext, name) in extensions {
             eprintln!("// {}", name);
 
@@ -229,10 +255,12 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
             });
 
             for element in elements {
-                let name = element.tag_name().name();
-                if name == "enum" && element.attribute("extends").is_none() {
-                    if let Some(name) = element.attribute("name") {
-                        if name.ends_with("EXTENSION_NAME") {
+                let tag_name = element.tag_name().name();
+                if let Some(name) = element.attribute("name") {
+                    if tag_name == "enum" {
+                        if element.attribute("extends").is_none()
+                            && name.ends_with("EXTENSION_NAME")
+                        {
                             if let Some(value) = element.attribute("value") {
                                 let len = name.len() - "_EXTENSION_NAME".len();
                                 eprintln!(
@@ -240,6 +268,20 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
                                     &name[3..len],
                                     &value[..value.len() - 1]
                                 );
+                            }
+                        }
+                    } else if (tag_name == "type") || (tag_name == "command") {
+                        if let Some(alias) =
+                            aliases.iter().find(|alias| alias.base.new_name == name)
+                        {
+                            eprintln!(
+                                "pub type {} = {};",
+                                alias.base.new_name, alias.base.original_name
+                            );
+                        } else if tag_name == "type" {
+                            if let Some(s) = structs.iter().find(|s| s.base.name == name) {
+                                s.base
+                                    .emit(handles, &mut std::io::stderr(), &mut self.buffer)?;
                             }
                         }
                     }
@@ -290,47 +332,75 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
         Ok(handles)
     }
 
-    pub fn emit_structs(&mut self, structs: Vec<Struct>, handles: &[&str]) -> std::io::Result<()> {
+    pub fn emit_structs(
+        &mut self,
+        structs: &[Category<Struct>],
+        handles: &[&str],
+    ) -> std::io::Result<()> {
         self.buffer.extend_from_slice(b"// Structures\n");
 
-        structs.into_iter().for_each(|s| {
-            // Note the length of the buffer as we might need to bail later.
-            let length = self.buffer.len();
+        structs
+            .iter()
+            .filter_map(|c| match c.sub_category {
+                ApiCategory::Core => Some(&c.base),
+                _ => None,
+            })
+            .for_each(|s| {
+                // Note the length of the buffer as we might need to bail later.
+                let length = self.buffer.len();
 
-            self.buffer.extend_from_slice(b"#[repr(C)]\n");
-            self.buffer.extend_from_slice(b"#[derive(Clone, Copy)]\n");
-            self.buffer.extend_from_slice(b"pub struct ");
+                self.buffer.extend_from_slice(b"#[repr(C)]\n");
+                self.buffer.extend_from_slice(b"#[derive(Clone, Copy)]\n");
+                self.buffer.extend_from_slice(b"pub struct ");
 
-            vk2rt(s.name, &mut self.buffer);
-            self.buffer.extend_from_slice(b" {\n");
+                vk2rt(s.name, &mut self.buffer);
+                self.buffer.extend_from_slice(b" {\n");
 
-            // Emit members
-            let mut emit = true;
-            for member in s.members {
-                self.buffer.extend_from_slice(b"    pub ");
-                vk2rm(&mut self.buffer, member.name);
-                self.buffer.extend_from_slice(b": ");
+                // Emit members
+                let mut emit = true;
+                for member in s.members.iter() {
+                    self.buffer.extend_from_slice(b"    pub ");
+                    vk2rm(&mut self.buffer, member.name);
+                    self.buffer.extend_from_slice(b": ");
 
-                let rtype = CToken::tokenize_and_resolve_handles(&member.ctype, handles);
+                    let rtype = CToken::tokenize_and_resolve_handles(&member.ctype, handles);
 
-                // If we have a colon, we would need to emit a bitfield. We don't support bitfield
-                // emission currently, so skip this structure.
-                if rtype.iter().any(|&c| c == CToken::Colon) {
-                    self.buffer.truncate(length);
-                    emit = false;
-                    break;
+                    // If we have a colon, we would need to emit a bitfield. We don't support bitfield
+                    // emission currently, so skip this structure.
+                    if rtype.iter().any(|&c| c == CToken::Colon) {
+                        self.buffer.truncate(length);
+                        emit = false;
+                        break;
+                    }
+
+                    ct2rt(&mut self.buffer, rtype);
+                    self.buffer.extend_from_slice(b",\n");
                 }
 
-                ct2rt(&mut self.buffer, rtype);
-                self.buffer.extend_from_slice(b",\n");
-            }
-
-            if emit {
-                self.buffer.extend_from_slice(b"}\n\n");
-            }
-        });
+                if emit {
+                    self.buffer.extend_from_slice(b"}\n\n");
+                }
+            });
 
         self.drain_write_all()
+    }
+
+    // TODO: Load all aliases.
+    //
+    // Emit aliases for structures, enums, unions, and handles.
+    pub fn load_aliases(&self) -> Vec<Alias<'i>> {
+        let mut aliases = Vec::new();
+
+        // Aliases in the `types` tags
+        let types = filter(self.root, "types").flat_map(|t| filter(t, "type"));
+
+        // Command aliases
+        let commands = filter(self.root, "commands").flat_map(|c| filter(c, "command"));
+
+        aliases.extend(types.filter_map(Alias::from_node));
+        aliases.extend(commands.filter_map(Alias::from_node));
+
+        aliases
     }
 
     pub fn load_constants(&mut self) -> Vec<Constant<'i>> {
@@ -367,6 +437,87 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
             root,
         }
     }
+}
+
+pub struct Alias<'a> {
+    pub new_name: &'a str,
+    pub original_name: &'a str,
+}
+
+impl<'a> Alias<'a> {
+    pub fn from_node(node: roxmltree::Node<'a, 'a>) -> Option<Self> {
+        let alias = node.attribute("alias")?;
+        let name = node.attribute("name")?;
+
+        let a = Alias {
+            new_name: name,
+            original_name: alias,
+        };
+        Some(a)
+    }
+}
+
+pub struct Category<T> {
+    base: T,
+    sub_category: ApiCategory,
+}
+
+impl<'a> Category<Alias<'a>> {
+    pub fn resolve_aliases(root: roxmltree::Node<'a, 'a>, aliases: Vec<Alias<'a>>) -> Vec<Self> {
+        aliases
+            .into_iter()
+            .map(|alias| {
+                let sub_category = if type_in_extensions(root, alias.original_name) {
+                    ApiCategory::Extension
+                } else {
+                    ApiCategory::Core
+                };
+
+                Self {
+                    base: alias,
+                    sub_category,
+                }
+            })
+            .collect()
+    }
+}
+
+impl<'s> Category<Struct<'s>> {
+    pub fn resolve_structs(root: roxmltree::Node<'s, 's>, structs: Vec<Struct<'s>>) -> Vec<Self> {
+        structs
+            .into_iter()
+            .map(|s| {
+                let sub_category = if type_in_extensions(root, s.name) {
+                    ApiCategory::Extension
+                } else {
+                    ApiCategory::Core
+                };
+
+                Self {
+                    base: s,
+                    sub_category,
+                }
+            })
+            .collect()
+    }
+}
+
+pub enum ApiCategory {
+    Core,
+    Extension,
+    Feature,
+}
+
+fn type_in_extensions(node: roxmltree::Node, name: &str) -> bool {
+    node.descendants()
+        .filter(|d| {
+            let name = d.tag_name().name();
+            d.is_element() && ((name == "type") || (name == "enum") || (name == "command"))
+        })
+        .any(|child| match child.attribute("name") {
+            Some(child_name) => child_name == name,
+            None => false,
+        })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -456,17 +607,25 @@ impl<'v> NonExtensionVariant<'v> {
             Self::Alias(a) => Cow::Borrowed(a),
             Self::BitPosition(b) => Cow::Owned(format!("0x{:X}", 0x1 << b)),
             Self::Integer(i) => {
-                if i.contains("ULL") {
-                    Cow::Owned(i.replace("ULL", ""))
-                } else if i.bytes().any(|b| b == b'f') {
-                    Cow::Owned(i.replace("f", ""))
-                } else if i.bytes().any(|b| b == b'U') {
-                    Cow::Owned(i.replace("U", ""))
-                } else if i.bytes().any(|b| b == b'~') {
-                    Cow::Owned(i.replace('~', "!"))
-                } else {
-                    Cow::Borrowed(i)
+                let mut result = Cow::Borrowed(*i);
+
+                if result.contains("ULL") {
+                    result = Cow::Owned(result.replace("ULL", ""));
                 }
+
+                if result.bytes().any(|b| b == b'f') {
+                    result = Cow::Owned(result.replace('f', ""));
+                }
+
+                if result.bytes().any(|b| b == b'U') {
+                    result = Cow::Owned(result.replace('U', ""));
+                }
+
+                if i.bytes().any(|b| b == b'~') {
+                    result = Cow::Owned(result.replace('~', "!"));
+                }
+
+                result
             }
         }
     }
@@ -478,6 +637,45 @@ pub struct Struct<'s> {
 }
 
 impl<'s> Struct<'s> {
+    pub fn emit<W>(
+        &self,
+        handles: &[&str],
+        writer: &mut W,
+        buffer: &mut Vec<u8>,
+    ) -> std::io::Result<()>
+    where
+        W: std::io::Write,
+    {
+        buffer.extend_from_slice(b"#[repr(C)]\n#[derive(Clone, Copy)]\npub struct ");
+        vk2rt(self.name, buffer);
+        buffer.extend_from_slice(b" {\n");
+
+        for member in self.members.iter() {
+            buffer.extend_from_slice(b"    pub ");
+            vk2rm(buffer, member.name);
+            buffer.extend_from_slice(b": ");
+
+            let tokens = CToken::tokenize_and_resolve_handles(&member.ctype, handles);
+            if self.name == "VkPipelineLibraryCreateInfoKHR" {
+                dbg!(handles, &tokens);
+            }
+
+            if tokens.iter().any(|&token| token == CToken::Colon) {
+                buffer.clear();
+                return Ok(());
+            }
+
+            ct2rt(buffer, tokens);
+            buffer.extend_from_slice(b",\n");
+        }
+
+        buffer.extend_from_slice(b"}\n\n");
+
+        writer.write_all(buffer)?;
+        buffer.clear();
+        Ok(())
+    }
+
     pub fn from_node(node: roxmltree::Node<'s, 's>) -> Option<Self> {
         let name = node.attribute("name")?;
 
@@ -505,7 +703,10 @@ impl<'m> Member<'m> {
         // Find all text and type nodes that constitute the full type of the member
         let type_nodes = node
             .children()
-            .filter(|c| c.is_text() || c.tag_name().name() == "type")
+            .filter(|c| {
+                let name = c.tag_name().name();
+                c.is_text() || ((name != "name") && (name != "comment"))
+            })
             .filter_map(|t| t.text());
 
         // Find the name of the member
@@ -596,7 +797,11 @@ impl<'s> FunctionSection<'s> {
     /// 1. The function name and its return value, or
     /// 2. The name of one of the function's parameters and its corresponding type.
     pub fn extract(node: roxmltree::Node<'s, 's>) -> Option<Self> {
-        let name = find(node, "name").as_ref().and_then(roxmltree::Node::text);
+        let name = node
+            .children()
+            .find(|child| child.is_element() && (child.tag_name().name() == "name"))
+            .as_ref()
+            .and_then(roxmltree::Node::text);
         let mut type_name = String::new();
         node.children()
             .filter(|c| c.tag_name().name() != "name")
@@ -732,17 +937,25 @@ impl<'v> Variant<'v> {
                 Cow::Owned(value.to_string())
             }
             Self::Integer(i) => {
-                if i.contains("ULL") {
-                    Cow::Owned(i.replace("ULL", ""))
-                } else if i.bytes().any(|b| b == b'f') {
-                    Cow::Owned(i.replace("f", ""))
-                } else if i.bytes().any(|b| b == b'U') {
-                    Cow::Owned(i.replace("U", ""))
-                } else if i.bytes().any(|b| b == b'~') {
-                    Cow::Owned(i.replace('~', "!"))
-                } else {
-                    Cow::Borrowed(i)
+                let mut result = Cow::Borrowed(*i);
+
+                if result.contains("ULL") {
+                    result = Cow::Owned(result.replace("ULL", ""));
                 }
+
+                if result.bytes().any(|b| b == b'f') {
+                    result = Cow::Owned(result.replace('f', ""));
+                }
+
+                if result.bytes().any(|b| b == b'U') {
+                    result = Cow::Owned(result.replace('U', ""));
+                }
+
+                if i.bytes().any(|b| b == b'~') {
+                    result = Cow::Owned(result.replace('~', "!"));
+                }
+
+                result
             }
         }
     }
@@ -766,62 +979,69 @@ pub fn filter<'b, 'n>(
         .filter(move |child| child.is_element() && (name == child.tag_name().name()))
 }
 
-pub fn find<'n>(node: roxmltree::Node<'n, 'n>, name: &str) -> Option<roxmltree::Node<'n, 'n>> {
-    node.children()
-        .find(|child| child.is_element() && (child.tag_name().name() == name))
-}
-
 /// Convert a list of C tokens to a Rust type.
-fn ct2rt(buffer: &mut Vec<u8>, tokens: Vec<CToken>) {
-    let search = tokens.iter().find_map(|t| {
-        if let CToken::Identifier(s) = t {
-            Some(s)
-        } else {
-            None
-        }
-    });
+fn ct2rt(buffer: &mut Vec<u8>, mut tokens: Vec<CToken>) {
+    if (tokens.len() == 1)
+        || tokens.iter().any(|&t| t == CToken::BracketLeft)
+        || tokens.iter().any(|&t| t == CToken::Colon)
+    {
+        let search = tokens.iter().find_map(|t| {
+            if let CToken::Identifier(s) = t {
+                Some(s)
+            } else {
+                None
+            }
+        });
 
-    if let Some(identifier) = search {
-        if tokens.len() == 1 {
-            vk2rt(identifier, buffer);
-        } else if tokens.iter().any(|t| *t == CToken::Colon) {
-            todo!("Bitfields!");
-        } else if tokens.iter().any(|t| *t == CToken::BracketLeft) {
-            // Array
-            let mut stack = Vec::with_capacity(8);
-            for t in tokens.iter() {
-                if let CToken::Literal(l) = t {
-                    stack.push(l);
-                }
-            }
-
-            for _ in 0..stack.len() {
-                buffer.push(b'[');
-            }
-            vk2rt(identifier, buffer);
-            for length in stack.into_iter().rev() {
-                buffer.extend_from_slice(b"; ");
-                buffer.extend_from_slice(length.as_bytes());
-                buffer.push(b']');
-            }
-        } else {
-            // Pointers
-            let mut seen_pointer = false;
-            for (i, t) in tokens.iter().enumerate().rev() {
-                if seen_pointer {
-                    if *t == CToken::Qualifier(CQualifier::Const) {
-                        buffer.extend_from_slice(b"*const ");
-                        seen_pointer = false;
-                    } else if (*t == CToken::Pointer) || (i == 0) {
-                        // `**` or <identifier> * so we must append mut to the pointer we have
-                        // already seen before
-                        buffer.extend_from_slice(b"*mut ");
+        if let Some(identifier) = search {
+            if tokens.len() == 1 {
+                vk2rt(identifier, buffer);
+            } else if tokens.iter().any(|t| *t == CToken::Colon) {
+                todo!("Bitfields!");
+            } else if tokens.iter().any(|t| *t == CToken::BracketLeft) {
+                // Array
+                let mut stack = Vec::with_capacity(8);
+                for t in tokens.iter() {
+                    if let CToken::Literal(l) = t {
+                        stack.push(l);
                     }
-                } else {
-                    seen_pointer = *t == CToken::Pointer;
+                }
+
+                for _ in 0..stack.len() {
+                    buffer.push(b'[');
+                }
+                vk2rt(identifier, buffer);
+                for length in stack.into_iter().rev() {
+                    buffer.extend_from_slice(b"; ");
+                    buffer.extend_from_slice(length.as_bytes());
+                    buffer.push(b']');
                 }
             }
+        }
+    } else if let Some(i) = tokens
+        .iter()
+        .position(|&t| matches!(t, CToken::Identifier(_)))
+    {
+        // Moving the identifier to the end turns the C pointer type into a Rust pointer type.
+        let last = tokens.len() - 1;
+        tokens.swap(i, last);
 
+        // Pointers
+        let mut is_const = false;
+        for t in tokens.iter() {
+            if *t == CToken::Pointer {
+                if is_const {
+                    buffer.extend_from_slice(b"*const ");
+                    is_const = false;
+                } else {
+                    buffer.extend_from_slice(b"*mut ");
+                }
+            } else {
+                is_const = *t == CToken::Qualifier(CQualifier::Const);
+            }
+        }
+
+        if let Some(CToken::Identifier(identifier)) = tokens.last() {
             vk2rt(identifier, buffer);
         }
     }
