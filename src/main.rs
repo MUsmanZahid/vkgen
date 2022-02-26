@@ -9,7 +9,10 @@
 //     [X] - Enumerations
 //     [X] - Structures
 // [X] - Store all identifiers in memory and emit in an organised format.
-// [ ] - Emit bitmask types
+// [ ] - Bitmask types
+//     [X] - Emit
+//     [ ] - Resolve
+// [ ] - Emit `PFN_vk` types.
 // [ ] - Emit features
 // [ ] - Generate function pointer loading library
 // [ ] - Remove extra indirection - we first write to buffer, then we copy from buffer into output
@@ -101,9 +104,11 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
     }
 
     pub fn emit(mut self) -> std::io::Result<()> {
-        let constants = self.load_constants();
         let aliases = Category::resolve_aliases(self.root, self.load_aliases());
+        // TODO: Resolve bitmasks
+        let bitmasks = self.load_bitmasks();
         let commands = Category::resolve_commands(self.root, self.load_commands());
+        let constants = self.load_constants();
         let structs = Category::resolve_structs(self.root, self.load_structs());
 
         // Add imports at the very top
@@ -115,6 +120,7 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
 
         self.emit_structs(&structs, &handles)?;
         self.emit_enums()?;
+        self.emit_bitmasks(bitmasks)?;
         self.emit_commands(&commands, &handles)?;
         self.emit_aliases(&aliases)?;
 
@@ -123,7 +129,7 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
         Ok(())
     }
 
-    pub fn emit_aliases(&mut self, aliases: &[Category<Alias<'i>>]) -> std::io::Result<()> {
+    fn emit_aliases(&mut self, aliases: &[Category<Alias<'i>>]) -> std::io::Result<()> {
         self.buffer.extend_from_slice(b"// Aliases\n");
         aliases.iter().for_each(|alias| {
             if let Category {
@@ -143,7 +149,19 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
         self.drain_write_all()
     }
 
-    pub fn emit_commands(
+    fn emit_bitmasks(&mut self, bitmasks: Vec<&str>) -> std::io::Result<()> {
+        self.buffer.extend_from_slice(b"// Bitmasks\npub type Flags = u32;\n");
+        bitmasks.into_iter().for_each(|bitmask| {
+            self.buffer.extend_from_slice(b"pub type ");
+            vk2rt(bitmask, &mut self.buffer);
+            self.buffer.extend_from_slice(b" = Flags;\n");
+        });
+
+        self.buffer.push(b'\n');
+        self.drain_write_all()
+    }
+
+    fn emit_commands(
         &mut self,
         commands: &[Category<Command<'i>>],
         handles: &[&str],
@@ -158,7 +176,7 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
         self.drain_write_all()
     }
 
-    pub fn emit_constants(&mut self, constants: Vec<Constant>) -> std::io::Result<()> {
+    fn emit_constants(&mut self, constants: Vec<Constant>) -> std::io::Result<()> {
         self.buffer.extend_from_slice(b"// Constants\n");
         for constant in constants {
             self.buffer.extend_from_slice(b"pub const ");
@@ -190,7 +208,7 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
         self.drain_write_all()
     }
 
-    pub fn emit_enums(&mut self) -> std::io::Result<()> {
+    fn emit_enums(&mut self) -> std::io::Result<()> {
         // TODO: Maybe count how many enums and their corresponding variants we have.
         let mut map = std::collections::HashMap::with_capacity(512);
 
@@ -225,7 +243,7 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
         self.drain_write_all()
     }
 
-    pub fn emit_extensions(
+    fn emit_extensions(
         &mut self,
         aliases: &[Category<Alias>],
         commands: &[Category<Command>],
@@ -331,7 +349,7 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
     }
 
     // TODO: Move loading code into separate `load_handles` function.
-    pub fn emit_handles(&mut self) -> std::io::Result<Box<[&'i str]>> {
+    fn emit_handles(&mut self) -> std::io::Result<Box<[&'i str]>> {
         let handles: Box<[&str]> = filter(self.root, "types")
             .flat_map(|t| filter(t, "type"))
             .filter_map(|t| {
@@ -369,7 +387,7 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
         Ok(handles)
     }
 
-    pub fn emit_structs(
+    fn emit_structs(
         &mut self,
         structs: &[Category<Struct>],
         handles: &[&str],
@@ -423,7 +441,7 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
         self.drain_write_all()
     }
 
-    pub fn load_aliases(&self) -> Vec<Alias<'i>> {
+    fn load_aliases(&self) -> Vec<Alias<'i>> {
         let mut aliases = Vec::new();
 
         // Aliases in the `types` tags
@@ -438,14 +456,30 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
         aliases
     }
 
-    pub fn load_commands(&self) -> Vec<Command<'i>> {
+    fn load_bitmasks(&self) -> Vec<&'i str> {
+        filter(self.root, "types")
+            .flat_map(|types| {
+                types.children().filter(|child| {
+                    (child.tag_name().name() == "type")
+                        && matches!(child.attribute("category"), Some("bitmask"))
+                })
+            })
+            .filter_map(|t| {
+                t.children()
+                    .find(|child| child.tag_name().name() == "name")
+                    .and_then(|name| name.text())
+            })
+            .collect()
+    }
+
+    fn load_commands(&self) -> Vec<Command<'i>> {
         filter(self.root, "commands")
             .flat_map(|commands| filter(commands, "command"))
             .filter_map(Command::from_node)
             .collect()
     }
 
-    pub fn load_constants(&self) -> Vec<Constant<'i>> {
+    fn load_constants(&self) -> Vec<Constant<'i>> {
         let mut buffer = Vec::new();
 
         let node = filter(self.root, "enums")
@@ -459,7 +493,7 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
         buffer
     }
 
-    pub fn load_structs(&self) -> Vec<Struct<'i>> {
+    fn load_structs(&self) -> Vec<Struct<'i>> {
         filter(self.root, "types")
             .flat_map(|type_node| filter(type_node, "type"))
             .filter(|vk_struct| {
@@ -470,14 +504,6 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
             })
             .filter_map(Struct::from_node)
             .collect()
-    }
-
-    pub fn new(capacity: usize, output: W, root: roxmltree::Node<'i, 'i>) -> Self {
-        Self {
-            buffer: Vec::with_capacity(capacity),
-            output,
-            root,
-        }
     }
 }
 
