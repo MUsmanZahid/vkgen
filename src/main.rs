@@ -9,9 +9,9 @@
 //     [X] - Enumerations
 //     [X] - Structures
 // [X] - Store all identifiers in memory and emit in an organised format.
-// [ ] - Bitmask types
+// [X] - Bitmask types
 //     [X] - Emit
-//     [ ] - Resolve
+//     [X] - Resolve
 // [ ] - Emit `PFN_vk` types.
 // [ ] - Emit features
 // [ ] - Generate function pointer loading library
@@ -105,8 +105,7 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
 
     pub fn emit(mut self) -> std::io::Result<()> {
         let aliases = Category::resolve_aliases(self.root, self.load_aliases());
-        // TODO: Resolve bitmasks
-        let bitmasks = self.load_bitmasks();
+        let bitmasks = Category::resolve_bitmasks(self.root, self.load_bitmasks());
         let commands = Category::resolve_commands(self.root, self.load_commands());
         let constants = self.load_constants();
         let structs = Category::resolve_structs(self.root, self.load_structs());
@@ -120,11 +119,11 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
 
         self.emit_structs(&structs, &handles)?;
         self.emit_enums()?;
-        self.emit_bitmasks(bitmasks)?;
+        self.emit_bitmasks(&bitmasks)?;
         self.emit_commands(&commands, &handles)?;
         self.emit_aliases(&aliases)?;
 
-        self.emit_extensions(&aliases, &commands, &structs, &handles)?;
+        self.emit_extensions(&aliases, &bitmasks, &commands, &structs, &handles)?;
 
         Ok(())
     }
@@ -149,13 +148,17 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
         self.drain_write_all()
     }
 
-    fn emit_bitmasks(&mut self, bitmasks: Vec<&str>) -> std::io::Result<()> {
-        self.buffer.extend_from_slice(b"// Bitmasks\npub type Flags = u32;\n");
-        bitmasks.into_iter().for_each(|bitmask| {
-            self.buffer.extend_from_slice(b"pub type ");
-            vk2rt(bitmask, &mut self.buffer);
-            self.buffer.extend_from_slice(b" = Flags;\n");
-        });
+    fn emit_bitmasks(&mut self, bitmasks: &[Category<&str>]) -> std::io::Result<()> {
+        self.buffer
+            .extend_from_slice(b"// Bitmasks\npub type Flags = u32;\n");
+        bitmasks
+            .into_iter()
+            .filter(|category| matches!(category.sub_category, ApiCategory::Core))
+            .for_each(|category| {
+                self.buffer.extend_from_slice(b"pub type ");
+                vk2rt(category.base, &mut self.buffer);
+                self.buffer.extend_from_slice(b" = Flags;\n");
+            });
 
         self.buffer.push(b'\n');
         self.drain_write_all()
@@ -246,6 +249,7 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
     fn emit_extensions(
         &mut self,
         aliases: &[Category<Alias>],
+        bitmasks: &[Category<&str>],
         commands: &[Category<Command>],
         structs: &[Category<Struct>],
         handles: &[&str],
@@ -302,7 +306,7 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
                             vk2rt(alias.new_name, &mut self.buffer);
                             self.buffer.extend_from_slice(b" = ");
                             vk2rt(alias.original_name, &mut self.buffer);
-                            self.buffer.extend_from_slice(b";\n\n");
+                            self.buffer.extend_from_slice(b";\n");
                         } else if tag_name == "type" {
                             if let Some(Category {
                                 base: s,
@@ -325,6 +329,13 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
                                 {
                                     s.emit(handles, &mut self.buffer);
                                 }
+                            } else if let Some(Category {
+                                base: bitmask,
+                                sub_category: ApiCategory::Extension,
+                            }) = bitmasks.iter().find(|category| category.base == name) {
+                                self.buffer.extend_from_slice(b"pub type ");
+                                vk2rt(bitmask, &mut self.buffer);
+                                self.buffer.extend_from_slice(b" = Flags;\n");
                             }
                         } else if tag_name == "command" {
                             if let Some(Category {
@@ -400,43 +411,7 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
                 ApiCategory::Core => Some(&c.base),
                 _ => None,
             })
-            .for_each(|s| {
-                s.emit(handles, &mut self.buffer);
-                // Note the length of the buffer as we might need to bail later.
-                // let length = self.buffer.len();
-
-                // self.buffer.extend_from_slice(b"#[repr(C)]\n");
-                // self.buffer.extend_from_slice(b"#[derive(Clone, Copy)]\n");
-                // self.buffer.extend_from_slice(b"pub struct ");
-
-                // vk2rt(s.name, &mut self.buffer);
-                // self.buffer.extend_from_slice(b" {\n");
-
-                // Emit members
-                // let mut emit = true;
-                // for member in s.members.iter() {
-                //     self.buffer.extend_from_slice(b"    pub ");
-                //     vk2rm(&mut self.buffer, member.name);
-                //     self.buffer.extend_from_slice(b": ");
-
-                //     let rtype = CToken::tokenize_and_resolve_handles(&member.ctype, handles);
-
-                //     // If we have a colon, we would need to emit a bitfield. We don't support bitfield
-                //     // emission currently, so skip this structure.
-                //     if rtype.iter().any(|&c| c == CToken::Colon) {
-                //         self.buffer.truncate(length);
-                //         emit = false;
-                //         break;
-                //     }
-
-                //     ct2rt(&mut self.buffer, rtype);
-                //     self.buffer.extend_from_slice(b",\n");
-                // }
-
-                // if emit {
-                //     self.buffer.extend_from_slice(b"}\n\n");
-                // }
-            });
+            .for_each(|s| s.emit(handles, &mut self.buffer));
 
         self.drain_write_all()
     }
@@ -530,6 +505,26 @@ pub struct Category<T> {
     sub_category: ApiCategory,
 }
 
+impl<'c> Category<&'c str> {
+    pub fn resolve_bitmasks(root: roxmltree::Node<'c, 'c>, bitmasks: Vec<&'c str>) -> Vec<Self> {
+        let mut b = Vec::new();
+
+        if let Some(extensions) = filter(root, "extensions").next() {
+            let categorized = bitmasks.into_iter().map(|bitmask| {
+                let sub_category = ApiCategory::resolve(extensions, bitmask);
+                Self {
+                    base: bitmask,
+                    sub_category,
+                }
+            });
+
+            b.extend(categorized);
+        }
+
+        b
+    }
+}
+
 impl<'a> Category<Alias<'a>> {
     pub fn resolve_aliases(root: roxmltree::Node<'a, 'a>, aliases: Vec<Alias<'a>>) -> Vec<Self> {
         let mut a = Vec::new();
@@ -543,7 +538,7 @@ impl<'a> Category<Alias<'a>> {
                 }
             });
 
-            a.extend(categorized)
+            a.extend(categorized);
         }
 
         a
