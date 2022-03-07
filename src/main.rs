@@ -12,7 +12,7 @@
 // [X] - Bitmask types
 //     [X] - Emit
 //     [X] - Resolve
-// [ ] - Emit `PFN_vk` types.
+// [X] - Emit `PFN_vk` types.
 // [ ] - Emit features
 // [ ] - Generate function pointer loading library
 // [ ] - Remove extra indirection - we first write to buffer, then we copy from buffer into output
@@ -495,7 +495,7 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
         Ok(())
     }
 
-    fn emit_function_pointers(&self) -> std::io::Result<()> {
+    fn emit_function_pointers(&mut self) -> std::io::Result<()> {
         let pointers: Vec<String> = self
             .root
             .descendants()
@@ -506,12 +506,93 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
             .map(|t| t.children().filter_map(|c| c.text()).collect())
             .collect();
 
+        self.buffer.extend_from_slice(b"// Function pointers\n");
         for pointer in pointers {
-            eprintln!("{}", pointer);
-            dbg!(CToken::tokenize(&pointer));
+            let tokens = CToken::tokenize(&pointer);
+
+            // Retrieving the return type - token list: TypeDef *XXXX* LeftParen
+            // Find the first left parenthesis
+            let return_type = tokens
+                .iter()
+                .position(|&t| t == CToken::ParenLeft)
+                .and_then(|i| tokens.get(1..i));
+
+            // Retrieving function pointer name - token list: TypeDef XXXX LeftParen Identifier
+            // Pointer *Identifier* RightParen
+            let name = tokens
+                .iter()
+                .position(|&t| t == CToken::ParenRight)
+                .and_then(|i| match tokens.get(i - 1) {
+                    Some(CToken::Identifier(i)) => Some(i),
+                    _ => None,
+                });
+
+            // Retrieving parameter types and names. Retrieve the second opening parenthesis in the
+            // function pointer definition: typedef XXXX (VKAPI_PTR *XXXX)`(`...);
+            //
+            // This leads us to the start of the functions' argument list.
+            let arguments = {
+                let find_second = |token: CToken, offset: usize| {
+                    tokens
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, &t)| t == token)
+                        .nth(1)
+                        .map(|(position, _)| position + offset)
+                };
+
+                let list_start = find_second(CToken::ParenLeft, 1);
+                let list_end = find_second(CToken::ParenRight, 0);
+
+                list_start
+                    .zip(list_end)
+                    .and_then(|(start, end)| tokens.get(start..end))
+                    .map(|mut list| {
+                        list = match list.first() {
+                            Some(CToken::Identifier("void")) if list.len() == 1 => &[],
+                            _ => list,
+                        };
+                        list.split(|&c| c == CToken::Comma)
+                    })
+            };
+
+            if let Some(((name, return_type), arguments)) = name.zip(return_type).zip(arguments) {
+                self.buffer.extend_from_slice(b"pub type ");
+                vk2rt(name, &mut self.buffer);
+                self.buffer.extend_from_slice(b" = unsafe extern \"system\" fn(");
+                for (i, argument) in arguments.enumerate() {
+                    let arg_name = argument.last();
+                    let arg_type = if argument.len() == 0 {
+                        None
+                    } else {
+                        argument.get(..argument.len() - 1)
+                    };
+
+                    if let Some((CToken::Identifier(n), t)) = arg_name.zip(arg_type) {
+                        if i > 0 {
+                            self.buffer.extend_from_slice(b", ");
+                        }
+
+                        vk2rm(&mut self.buffer, n);
+                        self.buffer.extend_from_slice(b": ");
+                        ct2rt(&mut self.buffer, t.to_owned());
+                    }
+                }
+                self.buffer.push(b')');
+
+                match return_type.first() {
+                    Some(CToken::Identifier("void")) if return_type.len() == 1 => {}
+                    _ => {
+                        self.buffer.extend_from_slice(b" -> ");
+                        ct2rt(&mut self.buffer, return_type.to_owned());
+                    }
+                }
+                self.buffer.extend_from_slice(b";\n");
+            }
         }
 
-        Ok(())
+        self.buffer.push(b'\n');
+        self.drain_write_all()
     }
 
     fn emit_handles(&mut self, handles: &[&str]) -> std::io::Result<()> {
@@ -1165,7 +1246,6 @@ enum CToken<'t> {
     Struct,
     TypeDef,
     Union,
-    Void,
     Volatile,
 }
 
@@ -1228,7 +1308,6 @@ impl<'t> CToken<'t> {
             "struct" => Self::Struct,
             "typedef" => Self::TypeDef,
             "union" => Self::Union,
-            "void" => Self::Void,
             "volatile" => Self::Volatile,
             s if s.as_bytes().iter().all(|b| b.is_ascii_digit()) => Self::Literal(bytes),
             _ => Self::Identifier(bytes),
