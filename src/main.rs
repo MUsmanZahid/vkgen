@@ -13,8 +13,10 @@
 //     [X] - Emit
 //     [X] - Resolve
 // [X] - Emit `PFN_vk` types.
-// [ ] - Emit features
+// [X] - Emit features
+// [X] - Rename variants starting with numbers to the numerals written out
 // [ ] - Generate function pointer loading library
+// [ ] - Testing
 // [ ] - Remove extra indirection - we first write to buffer, then we copy from buffer into output
 
 const BASIC_C_TYPE: [&str; 12] = [
@@ -82,13 +84,14 @@ pub fn process<W>(registry: roxmltree::Document, output: W) -> std::io::Result<(
 where
     W: std::io::Write,
 {
+    let root = registry.root_element();
     let generator = Generator {
         buffer: Vec::with_capacity(1024 * 1024),
         output,
-        root: registry.root_element(),
+        root,
     };
 
-    let registry = Registry::build(registry.root_element());
+    let registry = Registry::build(root);
     generator.emit(registry)
 }
 
@@ -103,7 +106,7 @@ impl Enum<'_> {
         vk2rt(self.name, buffer);
         buffer.extend_from_slice(b" {\n");
         vk2rv(self.name, &self.variants, buffer);
-        buffer.extend_from_slice(b"}\n");
+        buffer.extend_from_slice(b"}\n\n");
     }
 }
 
@@ -122,10 +125,10 @@ impl<'r> Registry<'r> {
         let extensions = filter(root, "extensions").next().unwrap_or(root);
 
         macro_rules! categorize {
-            ( $iter:expr ) => {
+            ( $iter:expr $(, $field:ident)? ) => {
                 $iter
                     .map(|t| {
-                        let sub_category = ApiCategory::resolve(extensions, t.name);
+                        let sub_category = ApiCategory::resolve(extensions, t$(.$field)?);
                         Category {
                             base: t,
                             sub_category,
@@ -135,24 +138,14 @@ impl<'r> Registry<'r> {
             };
         }
 
-        let bitmasks = Self::load_bitmasks(root)
-            .map(|b| {
-                let sub_category = ApiCategory::resolve(extensions, b);
-                Category {
-                    base: b,
-                    sub_category,
-                }
-            })
-            .collect();
-
         Self {
-            aliases: categorize!(Self::load_aliases(root)),
-            bitmasks,
-            commands: categorize!(Self::load_commands(root)),
+            aliases: categorize!(Self::load_aliases(root), name),
+            bitmasks: categorize!(Self::load_bitmasks(root)),
+            commands: categorize!(Self::load_commands(root), name),
             constants: Self::load_constants(root),
             enums: Self::load_enums(root),
             handles: Self::load_handles(root),
-            structures: categorize!(Self::load_structures(root)),
+            structures: categorize!(Self::load_structures(root), name),
         }
     }
 
@@ -214,7 +207,38 @@ impl<'r> Registry<'r> {
             })
             .collect();
 
-        // TODO: Insert variants from features
+        macro_rules! insert {
+            ( $iter:expr ) => {
+                for (extends, variant) in $iter {
+                    if let Some(i) = enums.iter().position(|e| e.name == extends) {
+                        if let Some(e) = enums.get_mut(i) {
+                            if e.variants.iter().all(|&v| v != variant) {
+                                e.variants.push(variant);
+                            }
+                        }
+                    } else {
+                        let e = Enum {
+                            name: extends,
+                            variants: vec![variant],
+                        };
+                        enums.push(e);
+                    }
+                }
+            };
+        }
+
+        // Insert variants from features
+        let features = filter(root, "feature")
+            .flat_map(|feature| {
+                feature
+                    .descendants()
+                    .filter(|d| d.tag_name().name() == "enum")
+            })
+            .filter_map(|e| {
+                e.attribute("extends")
+                    .zip(Enumerant::from_extension_node(e, "0"))
+            });
+        insert!(features);
 
         // Insert variants from extensions
         let extensions = filter(root, "extensions")
@@ -236,21 +260,7 @@ impl<'r> Registry<'r> {
                         .zip(Enumerant::from_extension_node(e, extnum))
                 });
 
-            for (extends, variant) in variants {
-                if let Some(i) = enums.iter().position(|e| e.name == extends) {
-                    if let Some(e) = enums.get_mut(i) {
-                        if e.variants.iter().all(|&v| v != variant) {
-                            e.variants.push(variant);
-                        }
-                    }
-                } else {
-                    let e = Enum {
-                        name: extends,
-                        variants: vec![variant],
-                    };
-                    enums.push(e);
-                }
-            }
+            insert!(variants);
         }
 
         enums.into_boxed_slice()
@@ -399,88 +409,88 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
             vk2rt(ext_name, &mut self.buffer);
             self.buffer.push(b'\n');
 
-            let elements = filter(ext, "require").flat_map(|req| {
-                req.children().filter(|c| {
-                    let name = c.tag_name().name();
-                    c.is_element() && ((name == "type") || (name == "enum") || (name == "command"))
+            let elements = filter(ext, "require")
+                .flat_map(|req| {
+                    req.children().filter(|c| {
+                        let name = c.tag_name().name();
+                        c.is_element()
+                            && ((name == "type") || (name == "enum") || (name == "command"))
+                    })
                 })
-            });
+                .filter_map(|element| element.attribute("name").map(|name| (element, name)));
 
-            for element in elements {
+            for (element, name) in elements {
                 let tag_name = element.tag_name().name();
-                if let Some(name) = element.attribute("name") {
-                    if tag_name == "enum" {
-                        if element.attribute("extends").is_none()
-                            && name.ends_with("EXTENSION_NAME")
-                        {
-                            if let Some(value) = element.attribute("value") {
-                                let len = name.len() - "_EXTENSION_NAME".len();
-                                let trimmed = name.get(3..len).zip(value.get(..value.len() - 1));
-                                if let Some((name, value)) = trimmed {
-                                    self.buffer.extend_from_slice(b"pub const ");
-                                    self.buffer.extend_from_slice(name.as_bytes());
-                                    self.buffer.extend_from_slice(b": &str = ");
-                                    self.buffer.extend_from_slice(value.as_bytes());
-                                    self.buffer.extend(b"\\u{0}\";\n");
-                                }
+                if tag_name == "enum" {
+                    if element.attribute("extends").is_none() && name.ends_with("EXTENSION_NAME") {
+                        if let Some(value) = element.attribute("value") {
+                            let len = name.len() - "_EXTENSION_NAME".len();
+                            let trimmed = name.get(3..len).zip(value.get(..value.len() - 1));
+                            if let Some((name, value)) = trimmed {
+                                self.buffer.extend_from_slice(b"pub const ");
+                                self.buffer.extend_from_slice(name.as_bytes());
+                                self.buffer.extend_from_slice(b": &str = ");
+                                self.buffer.extend_from_slice(value.as_bytes());
+                                self.buffer.extend(b"\\u{0}\";\n\n");
                             }
                         }
-                    } else if (tag_name == "type") || (tag_name == "command") {
+                    }
+                } else if (tag_name == "type") || (tag_name == "command") {
+                    if let Some(Category {
+                        base: alias,
+                        sub_category: ApiCategory::Extension,
+                    }) = registry
+                        .aliases
+                        .iter()
+                        .find(|alias| alias.base.name == name)
+                    {
+                        self.buffer.extend_from_slice(b"pub type ");
+                        vk2rt(alias.name, &mut self.buffer);
+                        self.buffer.extend_from_slice(b" = ");
+                        vk2rt(alias.original_name, &mut self.buffer);
+                        self.buffer.extend_from_slice(b";\n\n");
+                    } else if tag_name == "type" {
                         if let Some(Category {
-                            base: alias,
+                            base: s,
+                            sub_category: ApiCategory::Extension,
+                        }) = registry.structures.iter().find(|s| s.base.name == name)
+                        {
+                            // These structures are duplicated in the Vulkan XML registry in
+                            // the `VK_KHR_swapchain` extension so do not emit them.
+                            let exclusions = [
+                                "VkImageSwapchainCreateInfoKHR",
+                                "VkBindImageMemorySwapchainInfoKHR",
+                                "VkAcquireNextImageInfoKHR",
+                                "VkDeviceGroupPresentCapabilitiesKHR",
+                                "VkDeviceGroupPresentInfoKHR",
+                                "VkDeviceGroupSwapchainCreateInfoKHR",
+                            ];
+
+                            if !((ext_name == "VK_KHR_swapchain")
+                                && exclusions.iter().any(|&ex| ex == name))
+                            {
+                                s.emit(handles, &mut self.buffer);
+                            }
+                        } else if let Some(Category {
+                            base: bitmask,
                             sub_category: ApiCategory::Extension,
                         }) = registry
-                            .aliases
+                            .bitmasks
                             .iter()
-                            .find(|alias| alias.base.name == name)
+                            .find(|category| category.base == name)
                         {
                             self.buffer.extend_from_slice(b"pub type ");
-                            vk2rt(alias.name, &mut self.buffer);
-                            self.buffer.extend_from_slice(b" = ");
-                            vk2rt(alias.original_name, &mut self.buffer);
-                            self.buffer.extend_from_slice(b";\n");
-                        } else if tag_name == "type" {
-                            if let Some(Category {
-                                base: s,
-                                sub_category: ApiCategory::Extension,
-                            }) = registry.structures.iter().find(|s| s.base.name == name)
-                            {
-                                // These structures are duplicated in the Vulkan XML registry in
-                                // the `VK_KHR_swapchain` extension so do not emit them.
-                                let exclusions = [
-                                    "VkImageSwapchainCreateInfoKHR",
-                                    "VkBindImageMemorySwapchainInfoKHR",
-                                    "VkAcquireNextImageInfoKHR",
-                                    "VkDeviceGroupPresentCapabilitiesKHR",
-                                    "VkDeviceGroupPresentInfoKHR",
-                                    "VkDeviceGroupSwapchainCreateInfoKHR",
-                                ];
-
-                                if !((ext_name == "VK_KHR_swapchain")
-                                    && exclusions.iter().any(|&ex| ex == name))
-                                {
-                                    s.emit(handles, &mut self.buffer);
-                                }
-                            } else if let Some(Category {
-                                base: bitmask,
-                                sub_category: ApiCategory::Extension,
-                            }) = registry
-                                .bitmasks
-                                .iter()
-                                .find(|category| category.base == name)
-                            {
-                                self.buffer.extend_from_slice(b"pub type ");
-                                vk2rt(bitmask, &mut self.buffer);
-                                self.buffer.extend_from_slice(b" = Flags;\n");
-                            }
-                        } else if tag_name == "command" {
-                            if let Some(Category {
-                                base: command,
-                                sub_category: ApiCategory::Extension,
-                            }) = registry.commands.iter().find(|c| c.base.name == name)
-                            {
-                                command.emit(handles, &mut self.buffer);
-                            }
+                            vk2rt(bitmask, &mut self.buffer);
+                            self.buffer.extend_from_slice(b" = Flags;\n\n");
+                        }
+                    } else if tag_name == "command" {
+                        if let Some(Category {
+                            base: command,
+                            sub_category: ApiCategory::Extension,
+                        }) = registry.commands.iter().find(|c| c.base.name == name)
+                        {
+                            command.emit(handles, &mut self.buffer);
+                            self.buffer.push(b'\n');
                         }
                     }
                 }
@@ -510,15 +520,15 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
         for pointer in pointers {
             let tokens = CToken::tokenize(&pointer);
 
-            // Retrieving the return type - token list: TypeDef *XXXX* LeftParen
+            // Retrieving the return type - token list: typedef `XXXX` (
             // Find the first left parenthesis
             let return_type = tokens
                 .iter()
                 .position(|&t| t == CToken::ParenLeft)
                 .and_then(|i| tokens.get(1..i));
 
-            // Retrieving function pointer name - token list: TypeDef XXXX LeftParen Identifier
-            // Pointer *Identifier* RightParen
+            // Retrieving function pointer name - token list:
+            // typedef XXXX (<Identifier> *`<Identifier>`)
             let name = tokens
                 .iter()
                 .position(|&t| t == CToken::ParenRight)
@@ -528,7 +538,7 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
                 });
 
             // Retrieving parameter types and names. Retrieve the second opening parenthesis in the
-            // function pointer definition: typedef XXXX (VKAPI_PTR *XXXX)`(`...);
+            // function pointer definition: typedef XXXX (<Identifier> *<Identifier>)`(`...);
             //
             // This leads us to the start of the functions' argument list.
             let arguments = {
@@ -559,10 +569,11 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
             if let Some(((name, return_type), arguments)) = name.zip(return_type).zip(arguments) {
                 self.buffer.extend_from_slice(b"pub type ");
                 vk2rt(name, &mut self.buffer);
-                self.buffer.extend_from_slice(b" = unsafe extern \"system\" fn(");
+                self.buffer
+                    .extend_from_slice(b" = unsafe extern \"system\" fn(");
                 for (i, argument) in arguments.enumerate() {
                     let arg_name = argument.last();
-                    let arg_type = if argument.len() == 0 {
+                    let arg_type = if argument.is_empty() {
                         None
                     } else {
                         argument.get(..argument.len() - 1)
@@ -908,13 +919,15 @@ impl<'s> Struct<'s> {
             buffer.extend_from_slice(b": ");
 
             let tokens = CToken::tokenize_and_resolve_handles(&member.ctype, handles);
-            if tokens.iter().any(|&token| token == CToken::Colon) {
-                buffer.truncate(len);
-                return;
-            }
 
-            ct2rt(buffer, tokens);
-            buffer.extend_from_slice(b",\n");
+            // TODO: Add bitfield support
+            // Need to bail as we do not support emitting bitfield types from C
+            if tokens.iter().any(|&token| token == CToken::Colon) {
+                return buffer.truncate(len);
+            } else {
+                ct2rt(buffer, tokens);
+                buffer.extend_from_slice(b",\n");
+            }
         }
 
         buffer.extend_from_slice(b"}\n\n");
@@ -925,15 +938,15 @@ impl<'s> Struct<'s> {
 
         // Do not emit these placeholder structures
         if (name == "VkBaseInStructure") || (name == "VkBaseOutStructure") {
-            return None;
+            None
+        } else {
+            let members = filter(node, "member")
+                .filter_map(Member::from_node)
+                .collect();
+
+            let s = Self { name, members };
+            Some(s)
         }
-
-        let members = filter(node, "member")
-            .filter_map(Member::from_node)
-            .collect();
-
-        let s = Self { name, members };
-        Some(s)
     }
 }
 
@@ -958,8 +971,7 @@ impl<'m> Member<'m> {
         let name = node
             .children()
             .find(|c| c.tag_name().name() == "name")
-            .map(|m| m.text())
-            .flatten();
+            .and_then(|m| m.text());
 
         name.map(|name| Self {
             name,
@@ -1424,7 +1436,30 @@ fn vk2rv(name: &str, variants: &[Enumerant], w: &mut Vec<u8>) {
         //
         // Individual variants could have the suffix but it could be the case that it is not shared
         // across all variants. This means that we cannot strip it.
-        let name = strip_prefix(v.name, &prefix).unwrap_or(v.name);
+        let name = {
+            // If we are successful in stripping a prefix, we will have an `_` as the first
+            // character.
+            let variant = strip_prefix(v.name, &prefix).unwrap_or(v.name);
+
+            // In order to perform the upcoming check for digits, we need to look past the
+            // underscore and see whether the variant name contains digits.
+            let variant = if variant.starts_with('_')
+                && variant[1..].starts_with(|c: char| c.is_ascii_digit())
+            {
+                &variant[1..]
+            } else {
+                variant
+            };
+
+            // Find position of first non-digit character
+            match variant.as_bytes().iter().position(|b| !b.is_ascii_digit()) {
+                Some(x) if x > 0 => {
+                    d2w(&mut buffer, &variant[..x].as_bytes());
+                    &variant[x..]
+                }
+                _ => variant,
+            }
+        };
         ssc2cc(&mut buffer, name.bytes());
 
         buffer.extend_from_slice(b" = ");
@@ -1447,8 +1482,7 @@ fn strip_prefix<'i>(name: &'i str, prefix: &'i [u8]) -> Option<&'i str> {
     let prefix_index = prefix.iter().zip(name.bytes()).position(|(&l, r)| l != r);
 
     match prefix_index {
-        Some(0) | None => None,
-        Some(mut x) => {
+        Some(mut x) if x > 0 => {
             // Must limit match to a word boundary. In this case, a word boundary is `_` since
             // we're still working with a SCREAMING_SNAKE_CASE name.
             if !name.get(x..)?.starts_with('_') {
@@ -1458,6 +1492,60 @@ fn strip_prefix<'i>(name: &'i str, prefix: &'i [u8]) -> Option<&'i str> {
             }
 
             name.get(x..)
+        }
+        _ => None,
+    }
+}
+
+/// Convert digits to words.
+///
+/// Takes the string representation of a numeral and converts it into words. Output is written into
+/// buffer directly.
+///
+/// # Example
+/// d2w(&mut buffer, 128) # OneHundredTwentyEight
+fn d2w(buffer: &mut Vec<u8>, digits: &[u8]) {
+    let units = [
+        "", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine",
+    ];
+    let tens = [
+        "", "Ten", "Twenty", "Thirty", "Fourty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety",
+    ];
+    let teens = [
+        "Ten",
+        "Eleven",
+        "Twelve",
+        "Thirteen",
+        "Fourteen",
+        "Fifteen",
+        "Sixteen",
+        "Seventeen",
+        "Eighteen",
+        "Nineteen",
+    ];
+    let suffix = ["", "", "Hundred", "Thousand"];
+
+    let len = digits.len();
+    if len > 4 {
+        panic!("[d2w]: Cannot yet convert numbers greater than 4 digits in size!");
+    } else {
+        for (i, byte) in digits.iter().enumerate() {
+            let digit = (byte - b'0') as usize;
+            let digit_num = len - i - 1;
+            let prefix = if digit_num == 1 {
+                if digit == 1 {
+                    // In the 10-19 range
+                    buffer.extend_from_slice(teens[(digits[len - 1] - b'0') as usize].as_bytes());
+                    break;
+                } else {
+                    tens
+                }
+            } else {
+                units
+            };
+
+            buffer.extend_from_slice(prefix[digit].as_bytes());
+            buffer.extend_from_slice(suffix[digit_num].as_bytes());
         }
     }
 }
