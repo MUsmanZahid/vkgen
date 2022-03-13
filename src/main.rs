@@ -17,7 +17,11 @@
 // [X] - Rename variants starting with numbers to the numerals written out
 // [ ] - Generate function pointer loading library
 // [ ] - Testing
+//     [X] - Basic conversion functions
 // [ ] - Remove extra indirection - we first write to buffer, then we copy from buffer into output
+
+#[cfg(test)]
+mod tests;
 
 const BASIC_C_TYPE: [&str; 12] = [
     "void", "char", "float", "double", "uint8_t", "uint16_t", "uint32_t", "uint64_t", "int32_t",
@@ -1416,7 +1420,7 @@ fn vk2rv(name: &str, variants: &[Enumerant], w: &mut Vec<u8>) {
     }
 
     let mut prefix = Vec::with_capacity(128);
-    prefix.extend_from_slice(b"VK");
+    prefix.extend_from_slice(b"VK_");
     pc2ssc(&mut prefix, name.bytes().skip(2));
 
     // Append / so we pick up the end of the name and stop matching
@@ -1460,12 +1464,12 @@ fn vk2rv(name: &str, variants: &[Enumerant], w: &mut Vec<u8>) {
                 _ => variant,
             }
         };
-        ssc2cc(&mut buffer, name.bytes());
+        ssc2pc(&mut buffer, name.bytes());
 
         buffer.extend_from_slice(b" = ");
         if let Variant::Alias(alias) = v.value {
             let alias = strip_prefix(alias, &prefix).unwrap_or(alias);
-            ssc2cc(&mut buffer, alias.bytes());
+            ssc2pc(&mut buffer, alias.bytes());
         } else {
             let value = v.value.sanitize();
             buffer.extend_from_slice(value.as_bytes());
@@ -1551,7 +1555,7 @@ fn d2w(buffer: &mut Vec<u8>, digits: &[u8]) {
 }
 
 /// Convert an iterator over chars, B, from CAPS to PascalCase, storing it in `buffer`.
-pub fn c2pc<B>(buffer: &mut Vec<u8>, mut name: B)
+fn c2pc<B>(buffer: &mut Vec<u8>, mut name: B)
 where
     B: Iterator<Item = u8>,
 {
@@ -1563,14 +1567,16 @@ where
 
 /// Convert an iterator over bytes, `B`, from PascalCase to SCREAMING_SNAKE_CASE storing it in
 /// `buffer`.
-pub fn pc2ssc<B>(buffer: &mut Vec<u8>, name: B)
+fn pc2ssc<B>(buffer: &mut Vec<u8>, name: B)
 where
     B: Iterator<Item = u8>,
 {
-    for c in name {
-        if c.is_ascii_uppercase() {
-            let s = [b'_', c];
-            buffer.extend_from_slice(&s);
+    for (i, c) in name.enumerate() {
+        if c.is_ascii_uppercase(){
+            if i > 0 {
+                buffer.push(b'_');
+            }
+            buffer.push(c);
         } else {
             buffer.push(c.to_ascii_uppercase() as u8);
         }
@@ -1593,9 +1599,9 @@ pub fn cc2sc(buffer: &mut Vec<u8>, name: &str) {
     }
 }
 
-/// Convert an iterator over bytes, `B`, from SCREAMING_SNAKE_CASE to CamelCase storing it in
+/// Convert an iterator over bytes, `B`, from SCREAMING_SNAKE_CASE to PascalCase storing it in
 /// `buffer`.
-pub fn ssc2cc<B>(buffer: &mut Vec<u8>, bytes: B)
+pub fn ssc2pc<B>(buffer: &mut Vec<u8>, bytes: B)
 where
     B: Iterator<Item = u8>,
 {
