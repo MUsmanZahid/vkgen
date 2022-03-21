@@ -1,7 +1,9 @@
 /target
+/vk
 .idea
 .vs
 .vscode
+.DS_Store
 vk.rs
 vk.xml
 Cargo.lock

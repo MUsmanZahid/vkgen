@@ -15,6 +15,9 @@
 // [X] - Emit `PFN_vk` types.
 // [X] - Emit features
 // [X] - Rename variants starting with numbers to the numerals written out
+// [X] - Refactor extension emission code:
+//     [X] - Load extension
+//     [X] - Emit extension
 // [ ] - Generate function pointer loading library
 // [ ] - Testing
 //     [X] - Basic conversion functions
@@ -31,86 +34,98 @@ const BASIC_RUST_TYPE: [&str; 12] = [
     "c_void", "c_char", "f32", "f64", "u8", "u16", "u32", "u64", "i32", "i64", "usize", "i32",
 ];
 
-const OUTPUT_FILE_NAME: &str = "vk.rs";
+const BINDING_FILE_NAME: &str = "vk/bindings.rs";
+const LOADER_FILE_NAME: &str = "vk/loader.rs";
+const MODULE_FILE_NAME: &str = "vk/mod.rs";
+const OUTPUT_FOLDER_NAME: &str = "vk";
 
 fn main() -> std::io::Result<()> {
-    let result = std::fs::OpenOptions::new()
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| String::from("vk.xml"));
+    let xml = std::fs::read_to_string(&path)?;
+    let document = match roxmltree::Document::parse(&xml) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Failed to parse Vulkan XML registry!\n{}", e);
+            return Ok(());
+        }
+    };
+
+    let registry = Registry::build(document.root_element());
+    let mut working_buffer = Vec::with_capacity(1024 * 1024);
+
+    // Create the `vk` folder if it doesn't exist
+    if let Err(e) = std::fs::create_dir(OUTPUT_FOLDER_NAME) {
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(e);
+        }
+    }
+
+    // Emit Rust module file
+    if let Some(mut module) = ask_to_overwrite(MODULE_FILE_NAME)? {
+        use std::io::Write;
+        module.write_all(b"mod bindings;\npub mod loader;\n\npub use bindings::*;\n\n")?;
+    }
+
+    // Emit Vulkan bindings
+    if let Some(bindings) = ask_to_overwrite(BINDING_FILE_NAME)? {
+        working_buffer.clear();
+        Generator {
+            buffer: &mut working_buffer,
+            output: bindings,
+            root: document.root_element(),
+        }
+        .emit(&registry)?;
+    }
+
+    // Emit Vulkan meta-loader
+    if let Some(loader) = ask_to_overwrite(LOADER_FILE_NAME)? {
+        working_buffer.clear();
+        MetaLoader {
+            buffer: &mut working_buffer,
+            output: loader,
+            registry: &registry,
+        }
+        .emit()?;
+    }
+
+    Ok(())
+}
+
+fn ask_to_overwrite(path: &str) -> std::io::Result<Option<std::fs::File>> {
+    use std::io::Write;
+
+    match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(OUTPUT_FILE_NAME);
-    let output = match result {
-        Ok(f) => Some(f),
+        .open(path)
+    {
+        Ok(f) => Ok(Some(f)),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             // Ask to over-write
             print!(
                 "{} already exists. Would you like to over-write? (Y/N): ",
-                OUTPUT_FILE_NAME
+                path
             );
-            <_ as std::io::Write>::flush(&mut std::io::stdout())?;
+            std::io::stdout().flush()?;
 
             // Get input
             let mut buffer = String::new();
             std::io::stdin().read_line(&mut buffer)?;
             let input = buffer.trim_end().to_lowercase();
 
-            if input == "y" {
-                Some(std::fs::File::create(OUTPUT_FILE_NAME)?)
+            let answer = if input == "y" {
+                Some(std::fs::File::create(path)?)
             } else if input == "n" {
                 None
             } else {
                 eprintln!("Unknown input. Exiting...");
                 None
-            }
+            };
+            Ok(answer)
         }
-        Err(e) => return Err(e),
-    };
-
-    if let Some(output) = output {
-        let path = std::env::args()
-            .nth(1)
-            .unwrap_or_else(|| String::from("vk.xml"));
-        match std::fs::read_to_string(&path) {
-            Ok(source) => match roxmltree::Document::parse(&source) {
-                Ok(registry) => process(registry, std::io::BufWriter::new(output))?,
-                Err(e) => eprintln!("Failed to parse Vulkan XML registry!\n{}", e),
-            },
-            Err(e) => eprintln!(
-                "Could not read Vulkan XML registry at path `{}`!\n{}",
-                path, e
-            ),
-        };
-    }
-
-    Ok(())
-}
-
-pub fn process<W>(registry: roxmltree::Document, output: W) -> std::io::Result<()>
-where
-    W: std::io::Write,
-{
-    let root = registry.root_element();
-    let generator = Generator {
-        buffer: Vec::with_capacity(1024 * 1024),
-        output,
-        root,
-    };
-
-    let registry = Registry::build(root);
-    generator.emit(registry)
-}
-
-pub struct Enum<'e> {
-    pub name: &'e str,
-    pub variants: Vec<Enumerant<'e>>,
-}
-
-impl Enum<'_> {
-    pub fn emit(&self, buffer: &mut Vec<u8>) {
-        buffer.extend_from_slice(b"#[derive(Clone, Copy, Debug)]\n#[repr(C)]\npub enum ");
-        vk2rt(self.name, buffer);
-        buffer.extend_from_slice(b" {\n");
-        vk2rv(self.name, &self.variants, buffer);
-        buffer.extend_from_slice(b"}\n\n");
+        Err(e) => Err(e),
     }
 }
 
@@ -122,6 +137,7 @@ pub struct Registry<'r> {
     pub enums: Box<[Enum<'r>]>,
     pub handles: Box<[&'r str]>,
     pub structures: Box<[Category<Struct<'r>>]>,
+    pub extensions: Box<[Extension<'r>]>,
 }
 
 impl<'r> Registry<'r> {
@@ -142,14 +158,21 @@ impl<'r> Registry<'r> {
             };
         }
 
+        let aliases: Box<[_]> = categorize!(Self::load_aliases(root), name);
+        let bitmasks: Box<[_]> = categorize!(Self::load_bitmasks(root));
+        let commands: Box<[_]> = categorize!(Self::load_commands(root), name);
+        let structures: Box<[_]> = categorize!(Self::load_structures(root), name);
+
+        let extensions = Self::load_extensions(root, &aliases, &structures, &bitmasks, &commands);
         Self {
-            aliases: categorize!(Self::load_aliases(root), name),
-            bitmasks: categorize!(Self::load_bitmasks(root)),
-            commands: categorize!(Self::load_commands(root), name),
+            aliases,
+            bitmasks,
+            commands,
             constants: Self::load_constants(root),
             enums: Self::load_enums(root),
             handles: Self::load_handles(root),
-            structures: categorize!(Self::load_structures(root), name),
+            structures,
+            extensions,
         }
     }
 
@@ -270,6 +293,112 @@ impl<'r> Registry<'r> {
         enums.into_boxed_slice()
     }
 
+    fn load_extensions(
+        root: roxmltree::Node<'r, 'r>,
+        aliases: &[Category<Alias<'r>>],
+        structures: &[Category<Struct<'r>>],
+        bitmasks: &[Category<&'r str>],
+        commands: &[Category<Command<'r>>],
+    ) -> Box<[Extension<'r>]> {
+        let extensions = filter(root, "extensions")
+            .flat_map(|ext| filter(ext, "extension"))
+            .filter_map(|ext| {
+                if !matches!(ext.attribute("supported"), Some("disabled")) {
+                    ext.attribute("name").map(|n| (ext, n))
+                } else {
+                    None
+                }
+            });
+
+        extensions
+            .map(|(ext, ext_name)| {
+                let elements = filter(ext, "require")
+                    .flat_map(|req| {
+                        req.children().filter(|c| {
+                            let name = c.tag_name().name();
+                            c.is_element()
+                                && ((name == "type") || (name == "enum") || (name == "command"))
+                        })
+                    })
+                    .filter_map(|element| element.attribute("name").map(|name| (element, name)));
+
+                let mut ext_id = None;
+                let mut ext_aliases = Vec::new();
+                let mut ext_flags = Vec::new();
+                let mut ext_structs = Vec::new();
+                let mut ext_cmds = Vec::new();
+
+                for (element, name) in elements {
+                    let tag_name = element.tag_name().name();
+                    if tag_name == "enum" && name.ends_with("EXTENSION_NAME") {
+                        let name = {
+                            let len = name.len() - "_EXTENSION_NAME".len();
+                            name.get(3..len)
+                        };
+                        let value = element.attribute("value");
+                        ext_id = name
+                            .zip(value)
+                            .map(|(name, value)| ExtensionId { name, value });
+                    } else if (tag_name == "type") || (tag_name == "command") {
+                        if let Some(Category {
+                            base: alias,
+                            sub_category: ApiCategory::Extension,
+                        }) = aliases.iter().find(|alias| alias.base.name == name)
+                        {
+                            ext_aliases.push(*alias);
+                        } else if tag_name == "type" {
+                            if let Some(Category {
+                                base: s,
+                                sub_category: ApiCategory::Extension,
+                            }) = structures.iter().find(|s| s.base.name == name)
+                            {
+                                // These structures are duplicated in the Vulkan XML registry in
+                                // the `VK_KHR_swapchain` extension so do not emit them.
+                                let exclusions = [
+                                    "VkImageSwapchainCreateInfoKHR",
+                                    "VkBindImageMemorySwapchainInfoKHR",
+                                    "VkAcquireNextImageInfoKHR",
+                                    "VkDeviceGroupPresentCapabilitiesKHR",
+                                    "VkDeviceGroupPresentInfoKHR",
+                                    "VkDeviceGroupSwapchainCreateInfoKHR",
+                                ];
+
+                                if !((ext_name == "VK_KHR_swapchain")
+                                    && exclusions.iter().any(|&ex| ex == name))
+                                {
+                                    ext_structs.push(s.clone());
+                                }
+                            } else if let Some(Category {
+                                base: bitmask,
+                                sub_category: ApiCategory::Extension,
+                            }) = bitmasks.iter().find(|category| category.base == name)
+                            {
+                                ext_flags.push(*bitmask);
+                            }
+                        } else if tag_name == "command" {
+                            if let Some(Category {
+                                base: command,
+                                sub_category: ApiCategory::Extension,
+                            }) = commands.iter().find(|c| c.base.name == name)
+                            {
+                                ext_cmds.push(command.clone());
+                            }
+                        }
+                    }
+                }
+
+                Extension {
+                    name: ext_name,
+                    id: ext_id.expect("No identifier for extension found!"),
+                    flags: ext_flags,
+                    structs: ext_structs,
+                    cmds: ext_cmds,
+                    aliases: ext_aliases,
+                }
+            })
+            .collect()
+    }
+
     fn load_handles(root: roxmltree::Node<'r, 'r>) -> Box<[&'r str]> {
         filter(root, "types")
             .flat_map(|t| filter(t, "type"))
@@ -301,20 +430,33 @@ impl<'r> Registry<'r> {
     }
 }
 
+#[allow(dead_code)]
+pub struct MetaLoader<'m, 'r, O> {
+    buffer: &'m mut Vec<u8>,
+    output: O,
+    registry: &'m Registry<'r>,
+}
+
+impl<'m, 'r: 'm, O: std::io::Write> MetaLoader<'m, 'r, O> {
+    pub fn emit(self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 pub struct Generator<'i, W> {
-    buffer: Vec<u8>,
+    buffer: &'i mut Vec<u8>,
     output: W,
     root: roxmltree::Node<'i, 'i>,
 }
 
 impl<'i, W: std::io::Write> Generator<'i, W> {
     fn drain_write_all(&mut self) -> std::io::Result<()> {
-        self.output.write_all(&self.buffer)?;
+        self.output.write_all(self.buffer)?;
         self.buffer.clear();
         Ok(())
     }
 
-    pub fn emit(mut self, registry: Registry<'i>) -> std::io::Result<()> {
+    pub fn emit(mut self, registry: &Registry<'i>) -> std::io::Result<()> {
         // Emit imports
         self.buffer
             .extend_from_slice(b"use std::{ffi::c_void, os::raw::c_char};\n\n");
@@ -329,7 +471,7 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
         self.emit_commands(&registry.commands, &registry.handles)?;
         self.emit_aliases(&registry.aliases)?;
 
-        self.emit_extensions(&registry, &registry.handles)?;
+        self.emit_extensions(&registry.extensions, &registry.handles)?;
         Ok(())
     }
 
@@ -342,9 +484,9 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
             } = alias
             {
                 self.buffer.extend_from_slice(b"pub type ");
-                vk2rt(base.name, &mut self.buffer);
+                vk2rt(base.name, self.buffer);
                 self.buffer.extend_from_slice(b" = ");
-                vk2rt(base.original_name, &mut self.buffer);
+                vk2rt(base.original_name, self.buffer);
                 self.buffer.extend_from_slice(b";\n");
             }
         });
@@ -361,7 +503,7 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
             .filter(|category| matches!(category.sub_category, ApiCategory::Core))
             .for_each(|category| {
                 self.buffer.extend_from_slice(b"pub type ");
-                vk2rt(category.base, &mut self.buffer);
+                vk2rt(category.base, self.buffer);
                 self.buffer.extend_from_slice(b" = Flags;\n");
             });
 
@@ -378,7 +520,7 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
         commands
             .iter()
             .filter(|category| matches!(category.sub_category, ApiCategory::Core))
-            .for_each(|category| category.base.emit(handles, &mut self.buffer));
+            .for_each(|category| category.base.emit(handles, self.buffer));
 
         self.buffer.push(b'\n');
         self.drain_write_all()
@@ -386,127 +528,26 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
 
     fn emit_constants(&mut self, constants: &[Constant]) -> std::io::Result<()> {
         self.buffer.extend_from_slice(b"// Constants\n");
-        constants.iter().for_each(|c| c.emit(&mut self.buffer));
+        constants.iter().for_each(|c| c.emit(self.buffer));
         self.buffer.push(b'\n');
         self.drain_write_all()
     }
 
     fn emit_enums(&mut self, enums: &[Enum]) -> std::io::Result<()> {
         self.buffer.extend_from_slice(b"// Enumerations\n");
-        enums.iter().for_each(|e| e.emit(&mut self.buffer));
+        enums.iter().for_each(|e| e.emit(self.buffer));
         self.drain_write_all()
     }
 
-    fn emit_extensions(&mut self, registry: &Registry, handles: &[&str]) -> std::io::Result<()> {
-        let extensions = filter(self.root, "extensions")
-            .flat_map(|ext| filter(ext, "extension"))
-            .filter_map(|ext| {
-                if !matches!(ext.attribute("supported"), Some("disabled")) {
-                    ext.attribute("name").map(|n| (ext, n))
-                } else {
-                    None
-                }
-            });
-
-        for (ext, ext_name) in extensions {
-            self.buffer.extend_from_slice(b"// ");
-            vk2rt(ext_name, &mut self.buffer);
-            self.buffer.push(b'\n');
-
-            let elements = filter(ext, "require")
-                .flat_map(|req| {
-                    req.children().filter(|c| {
-                        let name = c.tag_name().name();
-                        c.is_element()
-                            && ((name == "type") || (name == "enum") || (name == "command"))
-                    })
-                })
-                .filter_map(|element| element.attribute("name").map(|name| (element, name)));
-
-            for (element, name) in elements {
-                let tag_name = element.tag_name().name();
-                if tag_name == "enum" {
-                    if element.attribute("extends").is_none() && name.ends_with("EXTENSION_NAME") {
-                        if let Some(value) = element.attribute("value") {
-                            let len = name.len() - "_EXTENSION_NAME".len();
-                            let trimmed = name.get(3..len).zip(value.get(..value.len() - 1));
-                            if let Some((name, value)) = trimmed {
-                                self.buffer.extend_from_slice(b"pub const ");
-                                self.buffer.extend_from_slice(name.as_bytes());
-                                self.buffer.extend_from_slice(b": &str = ");
-                                self.buffer.extend_from_slice(value.as_bytes());
-                                self.buffer.extend(b"\\u{0}\";\n\n");
-                            }
-                        }
-                    }
-                } else if (tag_name == "type") || (tag_name == "command") {
-                    if let Some(Category {
-                        base: alias,
-                        sub_category: ApiCategory::Extension,
-                    }) = registry
-                        .aliases
-                        .iter()
-                        .find(|alias| alias.base.name == name)
-                    {
-                        self.buffer.extend_from_slice(b"pub type ");
-                        vk2rt(alias.name, &mut self.buffer);
-                        self.buffer.extend_from_slice(b" = ");
-                        vk2rt(alias.original_name, &mut self.buffer);
-                        self.buffer.extend_from_slice(b";\n\n");
-                    } else if tag_name == "type" {
-                        if let Some(Category {
-                            base: s,
-                            sub_category: ApiCategory::Extension,
-                        }) = registry.structures.iter().find(|s| s.base.name == name)
-                        {
-                            // These structures are duplicated in the Vulkan XML registry in
-                            // the `VK_KHR_swapchain` extension so do not emit them.
-                            let exclusions = [
-                                "VkImageSwapchainCreateInfoKHR",
-                                "VkBindImageMemorySwapchainInfoKHR",
-                                "VkAcquireNextImageInfoKHR",
-                                "VkDeviceGroupPresentCapabilitiesKHR",
-                                "VkDeviceGroupPresentInfoKHR",
-                                "VkDeviceGroupSwapchainCreateInfoKHR",
-                            ];
-
-                            if !((ext_name == "VK_KHR_swapchain")
-                                && exclusions.iter().any(|&ex| ex == name))
-                            {
-                                s.emit(handles, &mut self.buffer);
-                            }
-                        } else if let Some(Category {
-                            base: bitmask,
-                            sub_category: ApiCategory::Extension,
-                        }) = registry
-                            .bitmasks
-                            .iter()
-                            .find(|category| category.base == name)
-                        {
-                            self.buffer.extend_from_slice(b"pub type ");
-                            vk2rt(bitmask, &mut self.buffer);
-                            self.buffer.extend_from_slice(b" = Flags;\n\n");
-                        }
-                    } else if tag_name == "command" {
-                        if let Some(Category {
-                            base: command,
-                            sub_category: ApiCategory::Extension,
-                        }) = registry.commands.iter().find(|c| c.base.name == name)
-                        {
-                            command.emit(handles, &mut self.buffer);
-                            self.buffer.push(b'\n');
-                        }
-                    }
-                }
-            }
-
-            if !self.buffer.ends_with(b"\n\n") {
-                self.buffer.push(b'\n');
-            }
-            self.drain_write_all()?;
-        }
-
-        Ok(())
+    fn emit_extensions(
+        &mut self,
+        extensions: &[Extension],
+        handles: &[&str],
+    ) -> std::io::Result<()> {
+        extensions
+            .iter()
+            .for_each(|ext| ext.emit(handles, self.buffer));
+        self.drain_write_all()
     }
 
     fn emit_function_pointers(&mut self) -> std::io::Result<()> {
@@ -572,7 +613,7 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
 
             if let Some(((name, return_type), arguments)) = name.zip(return_type).zip(arguments) {
                 self.buffer.extend_from_slice(b"pub type ");
-                vk2rt(name, &mut self.buffer);
+                vk2rt(name, self.buffer);
                 self.buffer
                     .extend_from_slice(b" = unsafe extern \"system\" fn(");
                 for (i, argument) in arguments.enumerate() {
@@ -588,9 +629,9 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
                             self.buffer.extend_from_slice(b", ");
                         }
 
-                        vk2rm(&mut self.buffer, n);
+                        vk2rm(self.buffer, n);
                         self.buffer.extend_from_slice(b": ");
-                        ct2rt(&mut self.buffer, t.to_owned());
+                        ct2rt(self.buffer, t.to_owned());
                     }
                 }
                 self.buffer.push(b')');
@@ -599,7 +640,7 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
                     Some(CToken::Identifier("void")) if return_type.len() == 1 => {}
                     _ => {
                         self.buffer.extend_from_slice(b" -> ");
-                        ct2rt(&mut self.buffer, return_type.to_owned());
+                        ct2rt(self.buffer, return_type.to_owned());
                     }
                 }
                 self.buffer.extend_from_slice(b";\n");
@@ -616,7 +657,7 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
             self.buffer.extend_from_slice(b"#[repr(C)]\n");
             self.buffer.extend_from_slice(b"#[derive(Clone, Copy)]\n");
             self.buffer.extend_from_slice(b"pub struct ");
-            vk2rt(name, &mut self.buffer);
+            vk2rt(name, self.buffer);
             self.buffer.extend_from_slice(b" {\n");
             self.buffer.extend_from_slice(b"    _data: [u8; 0],\n");
             self.buffer.extend_from_slice(
@@ -641,18 +682,27 @@ impl<'i, W: std::io::Write> Generator<'i, W> {
                 ApiCategory::Core => Some(&c.base),
                 _ => None,
             })
-            .for_each(|s| s.emit(handles, &mut self.buffer));
+            .for_each(|s| s.emit(handles, self.buffer));
 
         self.drain_write_all()
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Alias<'a> {
     pub name: &'a str,
     pub original_name: &'a str,
 }
 
 impl<'a> Alias<'a> {
+    pub fn emit(&self, buffer: &mut Vec<u8>) {
+        buffer.extend_from_slice(b"pub type ");
+        vk2rt(self.name, buffer);
+        buffer.extend_from_slice(b" = ");
+        vk2rt(self.original_name, buffer);
+        buffer.extend_from_slice(b";\n");
+    }
+
     pub fn from_node(node: roxmltree::Node<'a, 'a>) -> Option<Self> {
         let alias = node.attribute("alias")?;
         let name = node.attribute("name")?;
@@ -900,6 +950,75 @@ impl<'v> NonExtensionVariant<'v> {
             }
         }
     }
+}
+
+pub struct Enum<'e> {
+    pub name: &'e str,
+    pub variants: Vec<Enumerant<'e>>,
+}
+
+impl Enum<'_> {
+    pub fn emit(&self, buffer: &mut Vec<u8>) {
+        buffer.extend_from_slice(b"#[derive(Clone, Copy, Debug)]\n#[repr(C)]\npub enum ");
+        vk2rt(self.name, buffer);
+        buffer.extend_from_slice(b" {\n");
+        vk2rv(self.name, &self.variants, buffer);
+        buffer.extend_from_slice(b"}\n\n");
+    }
+}
+
+pub struct Extension<'e> {
+    name: &'e str,
+    id: ExtensionId<'e>,
+    flags: Vec<&'e str>,
+    structs: Vec<Struct<'e>>,
+    cmds: Vec<Command<'e>>,
+    aliases: Vec<Alias<'e>>,
+}
+
+impl Extension<'_> {
+    pub fn emit(&self, handles: &[&str], buffer: &mut Vec<u8>) {
+        let name_and_identifier = [
+            "// ",
+            self.name,
+            "\npub const ",
+            self.id.name,
+            ": &str = ",
+            self.id.value,
+            ";\n\n",
+        ];
+        name_and_identifier
+            .iter()
+            .for_each(|item| buffer.extend_from_slice(item.as_bytes()));
+
+        if self.flags.is_empty() {
+            self.flags.iter().for_each(|flag| {
+                let items = ["pub type ", flag, " = Flags;\n"];
+                items
+                    .iter()
+                    .for_each(|item| buffer.extend_from_slice(item.as_bytes()));
+            });
+            buffer.push(b'\n');
+        }
+
+        self.structs.iter().for_each(|s| s.emit(handles, buffer));
+
+        if self.cmds.is_empty() {
+            self.cmds.iter().for_each(|cmd| cmd.emit(handles, buffer));
+            buffer.push(b'\n');
+        }
+
+        if self.aliases.is_empty() {
+            self.aliases.iter().for_each(|alias| alias.emit(buffer));
+            buffer.push(b'\n');
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct ExtensionId<'i> {
+    name: &'i str,
+    value: &'i str,
 }
 
 #[derive(Clone, Debug)]
@@ -1458,7 +1577,7 @@ fn vk2rv(name: &str, variants: &[Enumerant], w: &mut Vec<u8>) {
             // Find position of first non-digit character
             match variant.as_bytes().iter().position(|b| !b.is_ascii_digit()) {
                 Some(x) if x > 0 => {
-                    d2w(&mut buffer, &variant[..x].as_bytes());
+                    d2w(&mut buffer, variant[..x].as_bytes());
                     &variant[x..]
                 }
                 _ => variant,
@@ -1572,7 +1691,7 @@ where
     B: Iterator<Item = u8>,
 {
     for (i, c) in name.enumerate() {
-        if c.is_ascii_uppercase(){
+        if c.is_ascii_uppercase() {
             if i > 0 {
                 buffer.push(b'_');
             }
