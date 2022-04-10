@@ -437,9 +437,67 @@ pub struct MetaLoader<'m, 'r, O> {
     registry: &'m Registry<'r>,
 }
 
-impl<'m, 'r: 'm, O: std::io::Write> MetaLoader<'m, 'r, O> {
-    pub fn emit(self) -> std::io::Result<()> {
+impl<'m, 'r, O: std::io::Write> MetaLoader<'m, 'r, O> {
+    pub fn emit(mut self) -> std::io::Result<()> {
+        let cast_raw = b"macro_rules! cast_raw {\n    ( $p:expr ) => {\n        *((&($p) as *const _) as *const Option<_>)\n    };\n}\n\n";
+        self.buffer.extend_from_slice(&cast_raw[..]);
+
+        self.emit_global_table();
+
+        // Instance-level functions
+
+        // Device-level functions
+
+        self.output.write_all(self.buffer)?;
+        self.buffer.clear();
+
         Ok(())
+    }
+
+    fn emit_global_table(&mut self) {
+        // Global functions
+        let global = [
+            "vkEnumerateInstanceVersion",
+            "vkEnumerateInstanceExtensionProperties",
+            "vkEnumerateInstanceLayerProperties",
+            "vkCreateInstance",
+        ];
+
+        self.buffer.extend_from_slice(b"pub struct GlobalTable {\n");
+        for g in global {
+            self.buffer.extend_from_slice(b"    pub ");
+            vk2rm(&mut self.buffer, &g[2..]);
+            self.buffer.extend_from_slice(b": Option<super::");
+            vk2rt(g, &mut self.buffer);
+            self.buffer.extend_from_slice(b">,\n");
+        }
+        self.buffer.extend_from_slice(b"}\n\n");
+
+        // Loading
+        let block = b"impl GlobalTable {\n";
+        let load = b"    pub unsafe fn load(f: super::GetInstanceProcAddr) -> Self {\n";
+        let instance = b"        let instance = std::ptr::null_mut();\n\n";
+        let table = b"        Self {\n";
+
+        let prelude = [
+            block.as_slice(),
+            load.as_slice(),
+            instance.as_slice(),
+            table.as_slice(),
+        ];
+        prelude
+            .iter()
+            .for_each(|item| self.buffer.extend_from_slice(item));
+
+        for g in global {
+            self.buffer.extend_from_slice(b"            ");
+            vk2rm(&mut self.buffer, &g[2..]);
+            self.buffer.extend_from_slice(b": cast_raw!(f(instance, \"");
+            self.buffer.extend_from_slice(g.as_bytes());
+            self.buffer.extend_from_slice(b"\\u{0}\")),\n");
+        }
+
+        self.buffer.extend_from_slice(b"        }\n    }\n}\n\n");
     }
 }
 
@@ -991,7 +1049,7 @@ impl Extension<'_> {
             .iter()
             .for_each(|item| buffer.extend_from_slice(item.as_bytes()));
 
-        if self.flags.is_empty() {
+        if !self.flags.is_empty() {
             self.flags.iter().for_each(|flag| {
                 let items = ["pub type ", flag, " = Flags;\n"];
                 items
@@ -1003,12 +1061,12 @@ impl Extension<'_> {
 
         self.structs.iter().for_each(|s| s.emit(handles, buffer));
 
-        if self.cmds.is_empty() {
+        if !self.cmds.is_empty() {
             self.cmds.iter().for_each(|cmd| cmd.emit(handles, buffer));
             buffer.push(b'\n');
         }
 
-        if self.aliases.is_empty() {
+        if !self.aliases.is_empty() {
             self.aliases.iter().for_each(|alias| alias.emit(buffer));
             buffer.push(b'\n');
         }
