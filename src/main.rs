@@ -34,6 +34,8 @@ const BASIC_RUST_TYPE: [&str; 12] = [
     "c_void", "c_char", "f32", "f64", "u8", "u16", "u32", "u64", "i32", "i64", "usize", "i32",
 ];
 
+const DEVICE_CHILD: [&str; 3] = ["VkDevice", "VkQueue", "VkCommandBuffer"];
+
 const BINDING_FILE_NAME: &str = "vk/bindings.rs";
 const LOADER_FILE_NAME: &str = "vk/loader.rs";
 const MODULE_FILE_NAME: &str = "vk/mod.rs";
@@ -43,11 +45,11 @@ fn main() -> std::io::Result<()> {
     let path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| String::from("vk.xml"));
-    let xml = std::fs::read_to_string(&path)?;
+    let xml = std::fs::read_to_string(path)?;
     let document = match roxmltree::Document::parse(&xml) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("Failed to parse Vulkan XML registry!\n{}", e);
+            eprintln!("Failed to parse Vulkan XML registry!\n{e}");
             return Ok(());
         }
     };
@@ -56,10 +58,8 @@ fn main() -> std::io::Result<()> {
     let mut working_buffer = Vec::with_capacity(1024 * 1024);
 
     // Create the `vk` folder if it doesn't exist
-    if let Err(e) = std::fs::create_dir(OUTPUT_FOLDER_NAME) {
-        if e.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(e);
-        }
+    if !std::path::Path::new(OUTPUT_FOLDER_NAME).exists() {
+        std::fs::create_dir(OUTPUT_FOLDER_NAME)?;
     }
 
     // Emit Rust module file
@@ -104,10 +104,7 @@ fn ask_to_overwrite(path: &str) -> std::io::Result<Option<std::fs::File>> {
         Ok(f) => Ok(Some(f)),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             // Ask to over-write
-            print!(
-                "{} already exists. Would you like to over-write? (Y/N): ",
-                path
-            );
+            print!("{path} already exists. Would you like to over-write? (Y/N): ");
             std::io::stdout().flush()?;
 
             // Get input
@@ -142,6 +139,8 @@ pub struct Registry<'r> {
 
 impl<'r> Registry<'r> {
     pub fn build(root: roxmltree::Node<'r, 'r>) -> Self {
+        // NOTE: Used in the macro below
+        #[allow(unused_variables)]
         let extensions = filter(root, "extensions").next().unwrap_or(root);
 
         macro_rules! categorize {
@@ -439,19 +438,56 @@ pub struct MetaLoader<'m, 'r, O> {
 
 impl<'m, 'r, O: std::io::Write> MetaLoader<'m, 'r, O> {
     pub fn emit(mut self) -> std::io::Result<()> {
-        let cast_raw = b"macro_rules! cast_raw {\n    ( $p:expr ) => {\n        *((&($p) as *const _) as *const Option<_>)\n    };\n}\n\n";
-        self.buffer.extend_from_slice(&cast_raw[..]);
+        let cast_raw = "macro_rules! cast_raw {
+    ( $p:expr ) => {
+        *((&($p) as *const _) as *const Option<_>)
+    };
+}
 
+";
+        let load = "macro_rules! load_table {
+    ( $f:ident, $src:ident, $($field:expr : $name:literal $(,)? )+ ) => {
+        Self {
+            (
+                $field: cast_raw!(f($src, $name)),
+            )+
+        }
+    };
+}
+
+";
+        self.buffer.extend_from_slice(cast_raw.as_bytes());
+        self.buffer.extend_from_slice(load.as_bytes());
+
+        // Global functions
         self.emit_global_table();
 
         // Instance-level functions
+        self.emit_instance_table();
 
         // Device-level functions
+        self.emit_device_table();
 
         self.output.write_all(self.buffer)?;
         self.buffer.clear();
 
         Ok(())
+    }
+
+    fn emit_device_table(&mut self) {
+        self.buffer.extend_from_slice(b"pub struct DeviceTable {\n");
+        for command in self.registry.commands.iter() {
+            if command.base.is_device_level() {
+                self.buffer.extend_from_slice(b"    pub ");
+                vk2rm(self.buffer, command.base.name);
+                self.buffer.extend_from_slice(b": Option<super::");
+                vk2rt(command.base.name, self.buffer);
+                self.buffer.extend_from_slice(b">,\n");
+            }
+        }
+        self.buffer.extend_from_slice(b"}\n\n");
+
+        // TODO: Loading
     }
 
     fn emit_global_table(&mut self) {
@@ -466,9 +502,9 @@ impl<'m, 'r, O: std::io::Write> MetaLoader<'m, 'r, O> {
         self.buffer.extend_from_slice(b"pub struct GlobalTable {\n");
         for g in global {
             self.buffer.extend_from_slice(b"    pub ");
-            vk2rm(&mut self.buffer, &g[2..]);
+            vk2rm(self.buffer, &g[2..]);
             self.buffer.extend_from_slice(b": Option<super::");
-            vk2rt(g, &mut self.buffer);
+            vk2rt(g, self.buffer);
             self.buffer.extend_from_slice(b">,\n");
         }
         self.buffer.extend_from_slice(b"}\n\n");
@@ -477,7 +513,8 @@ impl<'m, 'r, O: std::io::Write> MetaLoader<'m, 'r, O> {
         let block = b"impl GlobalTable {\n";
         let load = b"    pub unsafe fn load(f: super::GetInstanceProcAddr) -> Self {\n";
         let instance = b"        let instance = std::ptr::null_mut();\n\n";
-        let table = b"        Self {\n";
+        let table = b"        load_table!(\n            f,\n            instance,\n";
+        // let table = b"        Self {\n";
 
         let prelude = [
             block.as_slice(),
@@ -491,13 +528,41 @@ impl<'m, 'r, O: std::io::Write> MetaLoader<'m, 'r, O> {
 
         for g in global {
             self.buffer.extend_from_slice(b"            ");
-            vk2rm(&mut self.buffer, &g[2..]);
-            self.buffer.extend_from_slice(b": cast_raw!(f(instance, \"");
+            vk2rm(self.buffer, &g[2..]);
+            self.buffer.extend_from_slice(b": \"");
             self.buffer.extend_from_slice(g.as_bytes());
-            self.buffer.extend_from_slice(b"\\u{0}\")),\n");
+            self.buffer.extend_from_slice(b"\\u{0}\",\n");
         }
+        self.buffer.extend_from_slice(b"        )\n    }\n}\n\n");
 
-        self.buffer.extend_from_slice(b"        }\n    }\n}\n\n");
+        // for g in global {
+        //     self.buffer.extend_from_slice(b"            ");
+        //     vk2rm(self.buffer, &g[2..]);
+        //     self.buffer.extend_from_slice(b": cast_raw!(f(instance, \"");
+        //     self.buffer.extend_from_slice(g.as_bytes());
+        //     self.buffer.extend_from_slice(b"\\u{0}\")),\n");
+        // }
+        //
+        // self.buffer.extend_from_slice(b"        }\n    }\n}\n\n");
+    }
+
+    fn emit_instance_table(&mut self) {
+        self.buffer
+            .extend_from_slice(b"pub struct InstanceTable {\n");
+        for command in self.registry.commands.iter() {
+            if (command.base.name.trim() != "vkGetInstanceProcAddr")
+                && !command.base.is_device_level()
+            {
+                self.buffer.extend_from_slice(b"    pub ");
+                vk2rm(self.buffer, command.base.name);
+                self.buffer.extend_from_slice(b": Option<super::");
+                vk2rt(command.base.name, self.buffer);
+                self.buffer.extend_from_slice(b">,\n");
+            }
+        }
+        self.buffer.extend_from_slice(b"}\n\n");
+
+        // TODO: Loading
     }
 }
 
@@ -773,6 +838,7 @@ impl<'a> Alias<'a> {
     }
 }
 
+#[derive(Debug)]
 pub struct Category<T> {
     base: T,
     sub_category: ApiCategory,
@@ -814,6 +880,13 @@ pub struct Command<'c> {
 }
 
 impl<'c> Command<'c> {
+    pub fn is_device_level(&self) -> bool {
+        match self.parameters.first() {
+            Some(first) => DEVICE_CHILD.iter().any(|&c| c == first.type_name.trim()),
+            None => false,
+        }
+    }
+
     pub fn emit(&self, handles: &[&str], buffer: &mut Vec<u8>) {
         buffer.extend_from_slice(b"pub type ");
         vk2rt(self.name, buffer);
@@ -1556,7 +1629,7 @@ fn vk2rm(buffer: &mut Vec<u8>, mut name: &str) {
             }
         }
 
-        cc2sc(buffer, name);
+        cc2sc(buffer, name.bytes());
     }
 }
 
@@ -1755,15 +1828,18 @@ where
             }
             buffer.push(c);
         } else {
-            buffer.push(c.to_ascii_uppercase() as u8);
+            buffer.push(c.to_ascii_uppercase());
         }
     }
 }
 
 /// Convert a string from camelCase to snake_case.
-pub fn cc2sc(buffer: &mut Vec<u8>, name: &str) {
+pub fn cc2sc<B>(buffer: &mut Vec<u8>, name: B)
+where
+    B: Iterator<Item = u8>,
+{
     let mut was_upper = false;
-    for (i, c) in name.bytes().enumerate() {
+    for (i, c) in name.enumerate() {
         if c.is_ascii_uppercase() {
             if !was_upper && (i != 0) {
                 buffer.push(b'_');
