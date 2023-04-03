@@ -334,10 +334,14 @@ impl<'r> Registry<'r> {
                             let len = name.len() - "_EXTENSION_NAME".len();
                             name.get(3..len)
                         };
-                        let value = element.attribute("value");
-                        ext_id = name
-                            .zip(value)
-                            .map(|(name, value)| ExtensionId { name, value });
+
+                        // Do not set ext_id if this is an aliased extension
+                        if !element.has_attribute("alias") {
+                            let value = element.attribute("value");
+                            ext_id = name
+                                .zip(value)
+                                .map(|(name, value)| ExtensionId { name, value });
+                        }
                     } else if (tag_name == "type") || (tag_name == "command") {
                         if let Some(Category {
                             base: alias,
@@ -429,7 +433,6 @@ impl<'r> Registry<'r> {
     }
 }
 
-#[allow(dead_code)]
 pub struct MetaLoader<'m, 'r, O> {
     buffer: &'m mut Vec<u8>,
     output: O,
@@ -447,11 +450,9 @@ impl<'m, 'r, O: std::io::Write> MetaLoader<'m, 'r, O> {
 ";
         let load = "macro_rules! load_table {
     ( $f:ident, $src:ident, $($field:expr : $name:literal $(,)? )+ ) => {
-        Self {
-            (
-                $field: cast_raw!(f($src, $name)),
-            )+
-        }
+        (
+            $field: cast_raw!(f($src, $name)),
+        )+
     };
 }
 
@@ -468,6 +469,8 @@ impl<'m, 'r, O: std::io::Write> MetaLoader<'m, 'r, O> {
         // Device-level functions
         self.emit_device_table();
 
+        // TODO: Extensions
+
         self.output.write_all(self.buffer)?;
         self.buffer.clear();
 
@@ -475,7 +478,7 @@ impl<'m, 'r, O: std::io::Write> MetaLoader<'m, 'r, O> {
     }
 
     fn emit_device_table(&mut self) {
-        self.buffer.extend_from_slice(b"pub struct DeviceTable {\n");
+        self.buffer.extend_from_slice(b"pub struct DeviceTable<'d> {\n");
         for command in self.registry.commands.iter() {
             if command.base.is_device_level() {
                 self.buffer.extend_from_slice(b"    pub ");
@@ -485,9 +488,32 @@ impl<'m, 'r, O: std::io::Write> MetaLoader<'m, 'r, O> {
                 self.buffer.extend_from_slice(b">,\n");
             }
         }
-        self.buffer.extend_from_slice(b"}\n\n");
+        self.buffer.extend_from_slice(b"    _marker: core::marker::PhantomData<&'d usize>\n}\n\n");
 
         // TODO: Loading
+        let block = b"impl<'d> DeviceTable<'d> {\n";
+        let load = b"    pub unsafe fn load(device: &'d mut super::Device, f: super::GetDeviceProcAddr) -> Self {\n";
+        let table = b"        Self {\n            load_table!(\n                f,\n                device,\n";
+
+        let prelude = [
+            block.as_slice(),
+            load.as_slice(),
+            table.as_slice(),
+        ];
+        prelude
+            .iter()
+            .for_each(|item| self.buffer.extend_from_slice(item));
+
+        for command in self.registry.commands.iter() {
+            if command.base.is_device_level() {
+                self.buffer.extend_from_slice(b"                ");
+                vk2rm(self.buffer, command.base.name);
+                self.buffer.extend_from_slice(b": \"");
+                self.buffer.extend_from_slice(command.base.name.as_bytes());
+                self.buffer.extend_from_slice(b"\\u{0}\",\n");
+            }
+        }
+        self.buffer.extend_from_slice(b"\n            ),\n            _marker: core::marker::PhantomData,\n        }\n    }\n}\n\n");
     }
 
     fn emit_global_table(&mut self) {
@@ -513,8 +539,7 @@ impl<'m, 'r, O: std::io::Write> MetaLoader<'m, 'r, O> {
         let block = b"impl GlobalTable {\n";
         let load = b"    pub unsafe fn load(f: super::GetInstanceProcAddr) -> Self {\n";
         let instance = b"        let instance = std::ptr::null_mut();\n\n";
-        let table = b"        load_table!(\n            f,\n            instance,\n";
-        // let table = b"        Self {\n";
+        let table = b"        Self {\n            load_table!(\n                f,\n                instance,\n";
 
         let prelude = [
             block.as_slice(),
@@ -527,30 +552,24 @@ impl<'m, 'r, O: std::io::Write> MetaLoader<'m, 'r, O> {
             .for_each(|item| self.buffer.extend_from_slice(item));
 
         for g in global {
-            self.buffer.extend_from_slice(b"            ");
+            self.buffer.extend_from_slice(b"                ");
             vk2rm(self.buffer, &g[2..]);
             self.buffer.extend_from_slice(b": \"");
             self.buffer.extend_from_slice(g.as_bytes());
             self.buffer.extend_from_slice(b"\\u{0}\",\n");
         }
-        self.buffer.extend_from_slice(b"        )\n    }\n}\n\n");
-
-        // for g in global {
-        //     self.buffer.extend_from_slice(b"            ");
-        //     vk2rm(self.buffer, &g[2..]);
-        //     self.buffer.extend_from_slice(b": cast_raw!(f(instance, \"");
-        //     self.buffer.extend_from_slice(g.as_bytes());
-        //     self.buffer.extend_from_slice(b"\\u{0}\")),\n");
-        // }
-        //
-        // self.buffer.extend_from_slice(b"        }\n    }\n}\n\n");
+        self.buffer.extend_from_slice(b"            )\n        }\n    }\n}\n\n");
     }
 
     fn emit_instance_table(&mut self) {
+        let exclusions = [
+            "vkGetInstanceProcAddr",
+            "vkCreateInstance",
+        ];
         self.buffer
-            .extend_from_slice(b"pub struct InstanceTable {\n");
+            .extend_from_slice(b"pub struct InstanceTable<'i> {\n");
         for command in self.registry.commands.iter() {
-            if (command.base.name.trim() != "vkGetInstanceProcAddr")
+            if !exclusions.iter().any(|&e| e == command.base.name.trim())
                 && !command.base.is_device_level()
             {
                 self.buffer.extend_from_slice(b"    pub ");
@@ -560,9 +579,31 @@ impl<'m, 'r, O: std::io::Write> MetaLoader<'m, 'r, O> {
                 self.buffer.extend_from_slice(b">,\n");
             }
         }
-        self.buffer.extend_from_slice(b"}\n\n");
+        self.buffer.extend_from_slice(b"    _marker: core::marker::PhantomData<&'i usize>\n}\n\n");
 
-        // TODO: Loading
+        let block = b"impl<'i> InstanceTable<'i> {\n";
+        let load = b"    pub unsafe fn load(instance: &'i mut super::Instance, f: super::GetInstanceProcAddr) -> Self {\n";
+        let table = b"        Self {\n            load_table!(\n                f,\n                instance,\n";
+
+        let prelude = [
+            block.as_slice(),
+            load.as_slice(),
+            table.as_slice()
+        ];
+        prelude
+            .iter()
+            .for_each(|item| self.buffer.extend_from_slice(item));
+
+        for command in self.registry.commands.iter() {
+            if !exclusions.iter().any(|&e| e == command.base.name.trim()) && !command.base.is_device_level() {
+                self.buffer.extend_from_slice(b"                ");
+                vk2rm(self.buffer, command.base.name);
+                self.buffer.extend_from_slice(b": \"");
+                self.buffer.extend_from_slice(command.base.name.as_bytes());
+                self.buffer.extend_from_slice(b"\\u{0}\",\n");
+            }
+        }
+        self.buffer.extend_from_slice(b"\n            ),\n            _marker: core::marker::PhantomData,\n        }\n    }\n}\n\n");
     }
 }
 
@@ -1146,7 +1187,7 @@ impl Extension<'_> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct ExtensionId<'i> {
     name: &'i str,
     value: &'i str,
@@ -1373,7 +1414,7 @@ impl<'v> Variant<'v> {
 
         match self {
             Self::Alias(a) => Cow::Borrowed(a),
-            Self::BitPos(b) => Cow::Owned(format!("0x{:X}", 0x1 << b)),
+            Self::BitPos(b) => Cow::Owned(format!("0x{:X}", 0x1u64 << b)),
             Self::Extension {
                 number,
                 offset,
