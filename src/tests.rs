@@ -16,7 +16,7 @@ fn digits_to_words() {
 
     let mut buffer = Vec::new();
     for (digit, word) in digits.iter().zip(words.iter()) {
-        super::d2w(&mut buffer, digit.as_bytes());
+        super::conv::d2w(&mut buffer, digit.as_bytes());
         assert_eq!(word.as_bytes(), buffer.as_slice());
         buffer.clear();
     }
@@ -27,7 +27,7 @@ fn caps_to_pascal_case() {
     let mut buffer = Vec::new();
     let text = "CAPS";
 
-    super::c2pc(&mut buffer, text.bytes());
+    super::conv::c2pc(&mut buffer, text.bytes());
     assert_eq!(b"Caps", buffer.as_slice());
 }
 
@@ -35,7 +35,7 @@ fn caps_to_pascal_case() {
 fn pascal_case_to_screaming_snake_case() {
     let mut buffer = Vec::new();
     let text = "ThisIsPascalCase";
-    super::pc2ssc(&mut buffer, text.bytes());
+    super::conv::pc2ssc(&mut buffer, text.bytes());
 
     assert_eq!(b"THIS_IS_PASCAL_CASE", buffer.as_slice());
 }
@@ -44,7 +44,7 @@ fn pascal_case_to_screaming_snake_case() {
 fn camel_case_to_snake_case() {
     let mut buffer = Vec::new();
     let text = "thisIsCamelCase";
-    super::cc2sc(&mut buffer, text);
+    super::conv::cc2sc(&mut buffer, text.bytes());
 
     assert_eq!(b"this_is_camel_case", buffer.as_slice());
 }
@@ -53,7 +53,7 @@ fn camel_case_to_snake_case() {
 fn screaming_snake_case_to_pascal_case() {
     let mut buffer = Vec::new();
     let text = "HELLO_THERE_HOW_ARE_YOU";
-    super::ssc2pc(&mut buffer, text.bytes());
+    super::conv::ssc2pc(&mut buffer, text.bytes());
 
     assert_eq!(b"HelloThereHowAreYou", buffer.as_slice());
 }
